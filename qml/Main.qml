@@ -1,0 +1,1662 @@
+import QtQuick
+import QtQuick.Window
+import QtQuick.Layouts
+import QtQuick.Dialogs
+import glance
+
+Window {
+    id: root
+
+    readonly property int pageCount: Doc.pageCount
+    readonly property string fileName: Doc.fileName
+    readonly property real dpr: Screen.devicePixelRatio
+
+    property real zoom: 1.0
+    property int rotation: 0
+    property int currentPage: 1
+    property bool showThumbs: false
+    property bool showOutline: false
+    property var outlineModel: []
+    property bool searchActive: false
+    property string searchText: ""
+    property int searchPage: -1
+    property var searchBoxes: []
+    property var searchResults: []
+    property int searchResultIndex: -1
+    property int searchMatchCount: 0
+    property int searchGeneration: 0
+    property bool searchPending: false
+    property int searchInitialDirection: 1
+    property var selectionPages: ({})
+    property string selectionText: ""
+    readonly property bool spaceHeld: Input.spaceHeld && !typing
+    property bool pageLayoutReady: false
+    property bool pinchPreviewActive: false
+    property real pinchPreviewScale: 1.0
+    property real pinchAnchorContentX: 0
+    property real pinchAnchorContentY: 0
+    property real pinchAnchorViewportX: 0
+    property real pinchAnchorViewportY: 0
+    property int pinchAnchorPage: 0
+    property real pinchAnchorPageFraction: 0
+    property real pinchAnchorColumnFraction: 0.5
+    property var pageTextCapabilities: ({})
+    property int ocrGeneration: 0
+    property var ocrPages: ({})
+    property string ocrStatus: ""
+    property int ocrRequestedPage: -1
+    property bool ocrExplicit: false
+    property var ocrRegionKeys: ({})
+    property var pendingOcrRegion: null
+    property var nativeHoverCache: ({})
+    property var nativePageBoxes: ({})
+    property point viewportPointer: Qt.point(-1, -1)
+    property var viewportSelection: null
+    property bool viewportHasNativeText: false
+    property int perfFrames: 0
+    property var pageSizes: []
+    property var prefixHpt: []   // cumulative ptH before page i (upright)
+    property var prefixWpt: []   // cumulative ptW before page i (sideways)
+    property real maxPageW: 612
+    property real maxPageH: 792
+
+    readonly property real pageGap: 12
+    readonly property real pageTopPadding: 12
+    readonly property real pageBottomPadding: 16
+
+    color: Theme.background
+    title: fileName !== "" ? fileName + " — glance" : "glance"
+    width: InitialWindowWidth
+    height: InitialWindowHeight
+    minimumWidth: InitialIsImage ? 320 : 480
+    minimumHeight: InitialIsImage ? 220 : 300
+    visible: true
+
+    // ---------- helpers ----------
+
+    function computeExp(z) {
+        return Math.max(-3, Math.min(10, Math.round(Math.log(z) / Math.log(1.25))))
+    }
+
+    function prefetchAround() {
+        if (pageCount === 0)
+            return
+        const bucket = Math.pow(1.25, computeExp(zoom)) * dpr
+        Doc.prefetch(currentPage - 2, bucket)
+        Doc.prefetch(currentPage, bucket)
+    }
+
+    function pageTop(page) { // page is 1-based
+        const it = pagesCol.children[page - 1]
+        return it ? pagesCol.y + it.y : 0
+    }
+
+    function nowMs() {
+        try {
+            return performance.now()
+        } catch (e) {
+            return Date.now()
+        }
+    }
+
+    function detectPage() {
+        const t0 = nowMs()
+        const midY = view.contentY + view.height * 0.4
+        const n = pageCount
+        let found = false
+        for (let i = 0; i < n; ++i) {
+            const it = pagesCol.children[i]
+            if (!it)
+                continue
+            if (midY < pagesCol.y + it.y + it.height) {
+                currentPage = i + 1
+                found = true
+                break
+            }
+        }
+        if (!found)
+            currentPage = n
+        const dt = nowMs() - t0
+        if (dt > 1)
+            console.log("GLANCE detectPage ms=" + dt.toFixed(1))
+    }
+
+    function jumpTo(page, animate) {
+        if (page < 1 || page > pageCount)
+            return
+        const y = Math.max(0, Math.min(pageTop(page),
+                                       Math.max(0, view.contentHeight - view.height)))
+        if (animate) {
+            jumpAnim.to = y
+            jumpAnim.from = view.contentY
+            jumpAnim.restart()
+        } else {
+            view.contentY = y
+        }
+    }
+
+    function sideways() {
+        return rotation === 90 || rotation === 270
+    }
+    function sheetHpt(i) { // page height in points, rotation-aware
+        const s = pageSizes[i]
+        if (!s)
+            return 792
+        return sideways() ? s.width : s.height
+    }
+    function colW(z) { // width of the page column at zoom z
+        return (sideways() ? maxPageH : maxPageW) * z
+    }
+    function colX(z) { // left edge of the page column in content coords
+        const cw = colW(z)
+        return (Math.max(view.width, cw) - cw) / 2
+    }
+    function prefixAt(i) { // cumulative page height (pt) before page i
+        const arr = sideways() ? prefixWpt : prefixHpt
+        return arr[i] || 0
+    }
+    function pageTopAt(i, z) {
+        return pageTopPadding + pageGap * i + prefixAt(i) * z
+    }
+    function totalH(z) {
+        const n = pageCount
+        if (n === 0)
+            return 0
+        return pageTopPadding + pageGap * (n - 1) + prefixAt(n) * z + pageBottomPadding
+    }
+    function clampZoom(z) {
+        return Math.min(8.0, Math.max(0.2, z))
+    }
+    function anchorFrom(scenePoint, fallbackPoint) {
+        // Scene -> view(Flickable) coordinates; falls back to the handler's
+        // own reported position if scene mapping is unavailable.
+        try {
+            const p = view.mapFromItem(null, scenePoint)
+            if (p && isFinite(p.x) && isFinite(p.y))
+                return p
+        } catch (e) {
+        }
+        return fallbackPoint
+    }
+
+    // Zoom keeping the content under (ax, ay) — viewport coordinates — fixed.
+    function zoomAt(ax, ay, f) {
+        const z0 = zoom
+        const z1 = clampZoom(z0 * f)
+        if (z1 === z0)
+            return
+
+        const cx = view.contentX + ax
+        const cy = view.contentY + ay
+
+        // Horizontal: the page column scales uniformly, so preserve the
+        // fraction across the column (accounts for centering when the column
+        // is narrower than the viewport).
+        const cw0 = colW(z0)
+        const fx = cw0 > 0 ? (cx - colX(z0)) / cw0 : 0.5
+
+        // Vertical: gaps and padding do not scale, so preserve the page index
+        // and the fraction within that page.
+        const n = pageCount
+        let page = 0
+        let u = 0
+        if (n > 0) {
+            page = n - 1
+            for (let i = 0; i < n; ++i) {
+                const top = pageTopAt(i, z0)
+                const h = sheetHpt(i) * z0
+                if (cy < top + h) {
+                    page = i
+                    u = h > 0 ? (cy - top) / h : 0
+                    break
+                }
+                if (i === n - 1)
+                    u = 1
+            }
+        }
+
+        zoom = z1
+
+        const cw1 = colW(z1)
+        const newCx = colX(z1) + fx * cw1
+        const newCy = pageTopAt(page, z1) + u * sheetHpt(page) * z1
+        const maxX = Math.max(0, Math.max(view.width, cw1) - view.width)
+        const maxY = Math.max(0, totalH(z1) - view.height)
+        view.contentX = Math.min(Math.max(0, newCx - ax), maxX)
+        view.contentY = Math.min(Math.max(0, newCy - ay), maxY)
+    }
+
+    property bool initialFitDone: false
+    property bool autoFitSinglePage: false
+    function fitWidth(preserveAutoFit) {
+        if (pageCount === 0 || view.width < 100)
+            return
+        zoom = Math.min(8.0, Math.max(0.2, (view.width - 24) / root.maxPageW))
+        initialFitDone = true
+        if (!preserveAutoFit)
+            autoFitSinglePage = false
+    }
+
+    function fitPage() {
+        if (pageCount === 0)
+            return
+        const w = (view.width - 24) / maxPageW
+        const h = (view.height - 24) / maxPageH
+        zoom = Math.min(8.0, Math.max(0.2, Math.min(w, h)))
+    }
+
+    function rotateCW() {
+        rotation = (rotation + 90) % 360
+        view.contentY = Math.max(0, Math.min(view.contentY,
+                                             Math.max(0, view.contentHeight - view.height)))
+    }
+
+    function toggleFullscreen() {
+        if (visibility === Window.FullScreen)
+            showNormal()
+        else
+            showFullScreen()
+    }
+
+    function toggleOutline() {
+        showOutline = !showOutline
+        if (showOutline && outlineModel.length === 0)
+            outlineModel = Doc.outline()
+    }
+
+    function closeSearch() {
+        searchActive = false
+        searchText = ""
+        searchPage = -1
+        searchBoxes = []
+        searchResults = []
+        searchResultIndex = -1
+        searchMatchCount = 0
+        searchPending = false
+        searchGeneration += 1
+        Doc.cancelSearch()
+    }
+
+    function showSearchResult(index) {
+        if (searchResults.length === 0)
+            return
+        searchResultIndex = (index + searchResults.length) % searchResults.length
+        const result = searchResults[searchResultIndex]
+        searchPage = result.page
+        searchBoxes = result.boxes
+        jumpTo(result.page + 1, false)
+    }
+
+    function runSearch(reset, direction) {
+        if (Doc.pageCount === 0 || searchText.length < 1)
+            return
+        if (reset || searchResults.length === 0) {
+            searchPending = true
+            searchInitialDirection = direction || 1
+            searchGeneration += 1
+            Doc.cancelSearch()
+            Doc.searchAllAsync(searchText, searchGeneration)
+        } else {
+            showSearchResult(searchResultIndex + (direction || 1))
+        }
+    }
+
+    Connections {
+        target: Doc
+        function onSearchFinished(generation, results) {
+            if (generation !== root.searchGeneration || !root.searchActive)
+                return
+            root.searchPending = false
+            const merged = results.slice()
+            const query = root.searchText.toLowerCase()
+            const ocrPageKeys = Object.keys(root.ocrPages)
+            for (let i = 0; i < ocrPageKeys.length; ++i) {
+                const page = Number(ocrPageKeys[i])
+                if (root.ocrPages[page].embeddedText)
+                    continue
+                const words = root.ocrPages[page].words.filter(
+                    word => word.text.toLowerCase().includes(query))
+                if (words.length > 0)
+                    merged.push({ page: page, boxes: words, count: words.length })
+            }
+            merged.sort((a, b) => a.page - b.page)
+            root.searchResults = merged
+            root.searchMatchCount = 0
+            for (let i = 0; i < merged.length; ++i)
+                root.searchMatchCount += merged[i].count
+            if (merged.length === 0) {
+                root.searchPage = -1
+                root.searchBoxes = []
+                root.searchResultIndex = -1
+                return
+            }
+            let nearest = root.searchInitialDirection < 0 ? merged.length - 1 : 0
+            if (root.searchInitialDirection < 0) {
+                for (let i = merged.length - 1; i >= 0; --i) {
+                    if (merged[i].page <= root.currentPage - 1) {
+                        nearest = i
+                        break
+                    }
+                }
+            } else {
+                for (let i = 0; i < merged.length; ++i) {
+                    if (merged[i].page >= root.currentPage - 1) {
+                        nearest = i
+                        break
+                    }
+                }
+            }
+            root.showSearchResult(nearest)
+        }
+    }
+
+    function copyPage() {
+        if (selectionText !== "" && Doc.copyTextToClipboard(selectionText))
+            return
+        if (pageCount > 0 && Doc.copyPageToClipboard(currentPage - 1))
+            console.log("glance: page copied to clipboard")
+    }
+
+    function clearSelection() {
+        selectionPages = ({})
+        selectionText = ""
+    }
+
+    function pointInsideOcrWord(page, point) {
+        const words = sortedOcrWords(page)
+        for (let i = 0; i < words.length; ++i) {
+            const word = words[i]
+            if (point.x >= word.x && point.x <= word.x + word.w
+                    && point.y >= word.y && point.y <= word.y + word.h)
+                return i
+        }
+        return -1
+    }
+
+    function updateSelection(anchorPage, anchor, focusPage, focus, source) {
+        if (source === "ocr" && anchorPage === focusPage && ocrPages[anchorPage]) {
+            const characters = ocrCharacters(anchorPage)
+            if (characters.length > 0) {
+                const startChar = nearestOcrCharacter(characters, anchor)
+                const endChar = nearestOcrCharacter(characters, focus)
+                if (startChar.index >= 0 && endChar.index >= 0) {
+                    const firstChar = Math.min(startChar.index, endChar.index)
+                    const lastChar = Math.max(startChar.index, endChar.index)
+                    const selectedChars = characters.slice(firstChar, lastChar + 1)
+                    const charPages = {}
+                    charPages[anchorPage] = selectedChars
+                    selectionPages = charPages
+                    selectionText = ocrCharacterText(selectedChars)
+                    return
+                }
+            }
+            const words = sortedOcrWords(anchorPage)
+            const start = nearestOcrWord(words, anchor)
+            const end = nearestOcrWord(words, focus)
+            if (start.index >= 0 && end.index >= 0) {
+                const first = Math.min(start.index, end.index)
+                const last = Math.max(start.index, end.index)
+                const selected = words.slice(first, last + 1)
+                const pages = {}
+                pages[anchorPage] = selected
+                selectionPages = pages
+                selectionText = ocrText(selected)
+                return
+            }
+        }
+        const result = Doc.selectTextRange(anchorPage, anchor, focusPage, focus)
+        const pages = {}
+        for (let i = 0; i < result.pages.length; ++i)
+            pages[result.pages[i].page] = result.pages[i].boxes
+        selectionPages = pages
+        selectionText = result.text
+    }
+
+    function selectionBoxesForPage(page) {
+        return selectionPages[page] || []
+    }
+
+    function sortedOcrWords(page) {
+        if (!ocrPages[page])
+            return []
+        return ocrPages[page].words.slice().sort((a, b) =>
+            a.block !== b.block ? a.block - b.block
+            : a.paragraph !== b.paragraph ? a.paragraph - b.paragraph
+            : a.line !== b.line ? a.line - b.line
+            : a.word - b.word)
+    }
+
+    function nearestOcrWord(words, point) {
+        let nearest = -1
+        let best = Number.MAX_VALUE
+        for (let i = 0; i < words.length; ++i) {
+            const word = words[i]
+            const dx = point.x < word.x ? word.x - point.x
+                     : point.x > word.x + word.w ? point.x - word.x - word.w : 0
+            const dy = point.y < word.y ? word.y - point.y
+                     : point.y > word.y + word.h ? point.y - word.y - word.h : 0
+            const distance = dx * dx + dy * dy * 2
+            if (distance < best) {
+                best = distance
+                nearest = i
+            }
+        }
+        return { index: nearest, distance: best }
+    }
+
+    function ocrCharacters(page) {
+        const words = sortedOcrWords(page)
+        const characters = []
+        for (let i = 0; i < words.length; ++i) {
+            const chars = words[i].chars || []
+            for (let j = 0; j < chars.length; ++j) {
+                const character = Object.assign({}, chars[j])
+                character.wordIndex = i
+                character.block = words[i].block
+                character.paragraph = words[i].paragraph
+                character.line = words[i].line
+                character.charIndex = j
+                characters.push(character)
+            }
+        }
+        return characters
+    }
+
+    function nearestOcrCharacter(characters, point) {
+        let nearest = -1
+        let best = Number.MAX_VALUE
+        for (let i = 0; i < characters.length; ++i) {
+            const character = characters[i]
+            const dx = point.x < character.x ? character.x - point.x
+                     : point.x > character.x + character.w
+                       ? point.x - character.x - character.w : 0
+            const dy = point.y < character.y ? character.y - point.y
+                     : point.y > character.y + character.h
+                       ? point.y - character.y - character.h : 0
+            const distance = dx * dx + dy * dy * 2
+            if (distance < best) {
+                best = distance
+                nearest = i
+            }
+        }
+        return { index: nearest, distance: best }
+    }
+
+    function ocrCharacterText(characters) {
+        let text = ""
+        for (let i = 0; i < characters.length; ++i) {
+            if (i > 0 && characters[i - 1].wordIndex !== characters[i].wordIndex) {
+                const previous = characters[i - 1]
+                text += previous.block !== characters[i].block
+                     || previous.paragraph !== characters[i].paragraph
+                     || previous.line !== characters[i].line ? "\n" : " "
+            }
+            text += characters[i].text
+        }
+        return text
+    }
+
+    function ocrText(words) {
+        let text = ""
+        for (let i = 0; i < words.length; ++i) {
+            if (i > 0) {
+                const previous = words[i - 1]
+                text += previous.block !== words[i].block
+                     || previous.paragraph !== words[i].paragraph
+                     || previous.line !== words[i].line ? "\n" : " "
+            }
+            text += words[i].text
+        }
+        return text
+    }
+
+    function selectAt(page, point, mode) {
+        if (ocrPages[page]) {
+            const words = sortedOcrWords(page)
+            const nearest = nearestOcrWord(words, point)
+            const hit = nearest.index
+            if (hit < 0 && !ocrPages[page].embeddedText) {
+                clearSelection()
+                return
+            }
+            const closeEnough = hit >= 0 && nearest.distance <= 64
+            if (closeEnough) {
+                const chosen = mode === "line"
+                ? words.filter(word => {
+                    const center = word.y + word.h / 2
+                    const target = words[hit]
+                    return center >= target.y && center <= target.y + target.h
+                })
+                    : [words[hit]]
+                const pages = {}
+                pages[page] = chosen
+                selectionPages = pages
+                selectionText = ocrText(chosen)
+                return
+            }
+        }
+        const result = Doc.selectTextAt(page, point, mode)
+        const capabilities = Object.assign({}, pageTextCapabilities)
+        capabilities[page] = result.text !== ""
+        pageTextCapabilities = capabilities
+        const pages = {}
+        pages[page] = result.boxes
+        selectionPages = pages
+        selectionText = result.text
+    }
+
+    function selectionPoint(viewPoint) {
+        if (pageCount === 0)
+            return null
+        const contentY = view.contentY + viewPoint.y
+        let page = 0
+        for (let i = 0; i < pageCount; ++i) {
+            const item = pageRepeater.itemAt(i)
+            if (!item)
+                continue
+            const top = pagesCol.y + item.y
+            const bottom = top + item.height
+            if (contentY <= bottom) {
+                if (contentY < top && i > 0) {
+                    const previous = pageRepeater.itemAt(i - 1)
+                    const previousBottom = pagesCol.y + previous.y + previous.height
+                    page = contentY - previousBottom < top - contentY ? i - 1 : i
+                } else {
+                    page = i
+                }
+                break
+            }
+            if (i === pageCount - 1)
+                page = i
+        }
+        const item = pageRepeater.itemAt(page)
+        if (!item)
+            return null
+        return { page: page, point: item.mapViewPointToPage(viewPoint) }
+    }
+
+    function pageCanSelect(page) {
+        return pageTextCapabilities[page] !== false || ocrPages[page] !== undefined
+    }
+
+    function selectionCanSelect(selection) {
+        if (!selection)
+            return false
+        if (viewportHasNativeText)
+            return true
+        if (!ocrPages[selection.page])
+            return false
+        const point = selection.point
+        const words = ocrPages[selection.page].words
+        for (let i = 0; i < words.length; ++i) {
+            const word = words[i]
+            if (point.x >= word.x - 8 && point.x <= word.x + word.w + 8
+                    && point.y >= word.y - 8 && point.y <= word.y + word.h + 8)
+                return true
+        }
+        return false
+    }
+
+    function requestOcr(page, explicit) {
+        if (pageCount === 0)
+            return
+        if (Ocr.running) {
+            if (explicit) {
+                Ocr.cancel()
+                ocrGeneration += 1
+                ocrRequestedPage = -1
+                ocrStatus = "recognition cancelled"
+            }
+            return false
+        }
+        if (page < 0 || page >= pageCount || ocrPages[page] !== undefined)
+            return false
+        const hasText = Doc.pageHasText(page)
+        const capabilities = Object.assign({}, pageTextCapabilities)
+        capabilities[page] = hasText
+        pageTextCapabilities = capabilities
+        if (hasText && explicit) {
+            ocrStatus = "page already has selectable text"
+            return false
+        }
+        if (hasText) {
+            const size = Doc.pageSizePt(page)
+            const nativeSelection = Doc.selectText(page, Qt.point(0, 0),
+                                                    Qt.point(size.width, size.height))
+            const boxes = Object.assign({}, nativePageBoxes)
+            boxes[page] = nativeSelection.boxes
+            nativePageBoxes = boxes
+            if (!Doc.pageHasImages(page) || nativeSelection.text.length >= 200)
+                return false
+        }
+        ocrGeneration += 1
+        ocrRequestedPage = page
+        ocrExplicit = explicit
+        if (explicit)
+            ocrStatus = "recognizing page " + (page + 1)
+        Ocr.recognize(Doc.filePath, page, Doc.pageSizePt(page), ocrGeneration)
+        return true
+    }
+
+    function recognizeCurrentPage() {
+        requestOcr(Math.max(0, currentPage - 1), true)
+    }
+
+    function scheduleVisibleOcr() {
+        autoOcrTimer.restart()
+    }
+
+    function refreshViewportSelection() {
+        viewportSelection = viewportPointer.x >= 0
+            ? selectionPoint(viewportPointer) : null
+        viewportHasNativeText = viewportSelection
+            ? nativePointHasText(viewportSelection.page, viewportSelection.point) : false
+    }
+
+    function nativePointHasText(page, point) {
+        if (pageTextCapabilities[page] !== true)
+            return false
+        const key = page + ":" + Math.round(point.x / 3) + ":" + Math.round(point.y / 3)
+        if (nativeHoverCache[key] === true)
+            return true
+        const result = Doc.selectTextAt(page, point, "word")
+        let hit = false
+        for (let i = 0; i < result.boxes.length; ++i) {
+            const box = result.boxes[i]
+            if (point.x >= box.x - 5 && point.x <= box.x + box.w + 5
+                    && point.y >= box.y - 5 && point.y <= box.y + box.h + 5) {
+                hit = true
+                break
+            }
+        }
+        const cache = Object.assign({}, nativeHoverCache)
+        if (hit) {
+            cache[key] = true
+            nativeHoverCache = cache
+        }
+        return hit
+    }
+
+    onPageTextCapabilitiesChanged: refreshViewportSelection()
+    onZoomChanged: refreshViewportSelection()
+
+    function requestRegionalOcr(selection) {
+        if (!selection)
+            return false
+        const hasNativeText = pageTextCapabilities[selection.page] === true
+        if (!hasNativeText && !ocrPages[selection.page])
+            return false
+        if (hasNativeText && nativePointHasText(selection.page, selection.point))
+            return false
+        if (Ocr.running) {
+            if (ocrRequestedPage < 0 || ocrRequestedPage === selection.page)
+                return false
+            Ocr.cancel()
+            ocrGeneration += 1
+            ocrRequestedPage = -1
+        }
+        const point = selection.point
+        const words = ocrPages[selection.page] ? ocrPages[selection.page].words : []
+        for (let i = 0; i < words.length; ++i) {
+            const word = words[i]
+            if (point.x >= word.x - 6 && point.x <= word.x + word.w + 6
+                    && point.y >= word.y - 6 && point.y <= word.y + word.h + 6)
+                return false
+        }
+        const size = Doc.pageSizePt(selection.page)
+        const width = Math.min(100, size.width)
+        const height = Math.min(40, size.height)
+        const x = Math.max(0, Math.min(size.width - width, point.x - width / 2))
+        const y = Math.max(0, Math.min(size.height - height, point.y - height / 2))
+        const region = Qt.rect(x, y, width, height)
+        const key = selection.page + ":" + Math.round(x / 34) + ":" + Math.round(y / 16)
+        if (ocrRegionKeys[key])
+            return false
+        const keys = Object.assign({}, ocrRegionKeys)
+        keys[key] = true
+        ocrRegionKeys = keys
+        pendingOcrRegion = { page: selection.page, region: region }
+        ocrGeneration += 1
+        Ocr.recognizeRegion(Doc.filePath, selection.page, size, region, ocrGeneration)
+        return true
+    }
+
+    Connections {
+        target: Ocr
+        function onFinished(generation, page, text, words, error) {
+            if (generation !== root.ocrGeneration)
+                return
+            if (error !== "") {
+                root.ocrStatus = error
+                return
+            }
+            const embeddedText = root.pageTextCapabilities[page] === true
+            let filteredWords = words
+            if (embeddedText && root.nativePageBoxes[page]) {
+                const nativeBoxes = root.nativePageBoxes[page]
+                filteredWords = words.filter(word => {
+                    const cx = word.x + word.w / 2
+                    const cy = word.y + word.h / 2
+                    for (let i = 0; i < nativeBoxes.length; ++i) {
+                        const box = nativeBoxes[i]
+                        if (cx >= box.x && cx <= box.x + box.w
+                                && cy >= box.y && cy <= box.y + box.h)
+                            return false
+                    }
+                    return true
+                })
+            }
+            const pages = Object.assign({}, root.ocrPages)
+            pages[page] = { text: root.ocrText(filteredWords), words: filteredWords,
+                            embeddedText: embeddedText }
+            root.ocrPages = pages
+            root.refreshViewportSelection()
+            const capabilities = Object.assign({}, root.pageTextCapabilities)
+            capabilities[page] = true
+            root.pageTextCapabilities = capabilities
+            if (root.ocrExplicit)
+                root.ocrStatus = words.length + " words recognized"
+            root.ocrRequestedPage = -1
+            nearbyOcrTimer.restart()
+        }
+        function onRegionFinished(generation, page, region, words, error) {
+            if (generation !== root.ocrGeneration)
+                return
+            root.pendingOcrRegion = null
+            if (error !== "")
+                return
+            const previous = root.ocrPages[page]
+            const merged = previous ? previous.words.slice() : []
+            for (let i = 0; i < words.length; ++i) {
+                const candidate = words[i]
+                let duplicate = false
+                for (let j = 0; j < merged.length; ++j) {
+                    const existing = merged[j]
+                    const cx = candidate.x + candidate.w / 2
+                    const cy = candidate.y + candidate.h / 2
+                    if (cx >= existing.x && cx <= existing.x + existing.w
+                            && cy >= existing.y && cy <= existing.y + existing.h) {
+                        duplicate = true
+                        break
+                    }
+                }
+                if (!duplicate)
+                    merged.push(candidate)
+            }
+            merged.sort((a, b) => Math.abs(a.y - b.y) > Math.max(a.h, b.h) * 0.5
+                        ? a.y - b.y : a.x - b.x)
+            let line = 0
+            for (let i = 0; i < merged.length; ++i) {
+                if (i > 0 && Math.abs(merged[i].y - merged[i - 1].y)
+                        > Math.max(merged[i].h, merged[i - 1].h) * 0.5)
+                    line += 1
+                merged[i].block = 0
+                merged[i].paragraph = 0
+                merged[i].line = line
+                merged[i].word = i
+            }
+            const pages = Object.assign({}, root.ocrPages)
+            pages[page] = { text: root.ocrText(merged),
+                            words: merged,
+                            embeddedText: root.pageTextCapabilities[page] === true }
+            root.ocrPages = pages
+            root.refreshViewportSelection()
+        }
+    }
+
+    Timer {
+        id: autoOcrTimer
+        interval: 350
+        onTriggered: root.requestOcr(Math.max(0, root.currentPage - 1), false)
+    }
+
+    Timer {
+        id: nearbyOcrTimer
+        interval: 800
+        onTriggered: {
+            const page = Math.max(0, root.currentPage - 1)
+            if (!root.requestOcr(page + 1, false))
+                root.requestOcr(page - 1, false)
+        }
+    }
+
+    function openFromUrl(url) {
+        if (!url)
+            return
+        const path = url.toString().startsWith("file://")
+                    ? decodeURIComponent(url.toString().substring(7))
+                    : url.toString()
+        if (Doc.open(path)) {
+            clearSelection()
+            closeSearch()
+            pageTextCapabilities = ({})
+            showThumbs = false
+            currentPage = 1
+            view.contentY = 0
+        }
+    }
+
+    function computeSizes() {
+        const n = Doc.pageCount
+        const sizes = []
+        const prefixH = []
+        const prefixW = []
+        let maxW = 612, maxH = 792
+        let accH = 0, accW = 0
+        for (let i = 0; i < n; ++i) {
+            const s = Doc.pageSizePt(i)
+            sizes.push(s)
+            prefixH.push(accH)
+            prefixW.push(accW)
+            accH += s.height
+            accW += s.width
+            maxW = Math.max(maxW, s.width)
+            maxH = Math.max(maxH, s.height)
+        }
+        prefixH.push(accH)
+        prefixW.push(accW)
+        pageSizes = sizes
+        prefixHpt = prefixH
+        prefixWpt = prefixW
+        maxPageW = maxW
+        maxPageH = maxH
+        if (n > 0) {
+            autoFitSinglePage = (n === 1)
+            fitWidth(true)
+        }
+    }
+
+    // ---------- header ----------
+
+    component HeaderButton: Rectangle {
+        id: btn
+        property string label
+        property string tip
+        property bool activeFlag: false
+        signal activated()
+
+        width: 26
+        height: 26
+        radius: 6
+        color: ma.containsMouse ? Theme.selection : (activeFlag ? Theme.selection : "transparent")
+        border.color: activeFlag ? Theme.accent : "transparent"
+        border.width: 1
+
+        Text {
+            anchors.centerIn: parent
+            text: parent.label
+            color: ma.containsMouse ? Theme.accent : Theme.mutedForeground
+            font.pixelSize: 12
+            renderType: Text.QtRendering
+        }
+        MouseArea {
+            id: ma
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: btn.activated()
+        }
+    }
+
+    Rectangle {
+        id: header
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 40
+        color: Theme.darkerBackground
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 14
+            anchors.rightMargin: 8
+            spacing: 10
+
+            Text {
+                text: "glance"
+                color: Theme.accent
+                font.pixelSize: 14
+                font.weight: Font.DemiBold
+                font.letterSpacing: 0.5
+                renderType: Text.QtRendering
+            }
+            Rectangle {
+                Layout.preferredWidth: 1
+                Layout.preferredHeight: 18
+                color: Theme.mutedForeground
+                opacity: 0.28
+            }
+            Text {
+                text: fileName !== "" ? fileName : "no file"
+                color: fileName !== "" ? Theme.foreground : Theme.mutedForeground
+                font.pixelSize: 13
+                elide: Text.ElideMiddle
+                Layout.maximumWidth: parent.width * 0.4
+                renderType: Text.QtRendering
+            }
+            Text {
+                text: pageCount > 0 ? (currentPage + " / " + pageCount) : ""
+                color: Theme.foreground
+                opacity: 0.75
+                font.pixelSize: 12
+                renderType: Text.QtRendering
+            }
+            Text {
+                text: Math.round(zoom * 100) + "%"
+                color: Theme.mutedForeground
+                font.pixelSize: 12
+                Layout.preferredWidth: 46
+                renderType: Text.QtRendering
+            }
+            Item { Layout.fillWidth: true }
+
+            TextInput {
+                id: searchField
+                visible: root.searchActive
+                Layout.preferredWidth: visible ? 180 : 0
+                Layout.alignment: Qt.AlignVCenter
+                color: Theme.foreground
+                selectionColor: Theme.accent
+                selectedTextColor: Theme.darkerBackground
+                font.pixelSize: 12
+                renderType: Text.QtRendering
+                verticalAlignment: TextInput.AlignVCenter
+                clip: true
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "search…"
+                    visible: searchField.text === ""
+                    color: Theme.mutedForeground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                onTextChanged: {
+                    root.searchGeneration += 1
+                    Doc.cancelSearch()
+                    root.searchPending = false
+                    root.searchText = text
+                    root.searchResults = []
+                    root.searchResultIndex = -1
+                    root.searchMatchCount = 0
+                    root.searchPage = -1
+                    root.searchBoxes = []
+                }
+                onAccepted: root.runSearch(true, 1)
+                Keys.onEscapePressed: root.closeSearch()
+                onVisibleChanged: if (visible) forceActiveFocus()
+            }
+
+            HeaderButton {
+                visible: root.searchActive
+                label: "‹"
+                tip: "previous match page"
+                onActivated: root.runSearch(root.searchResults.length === 0, -1)
+            }
+            Text {
+                visible: root.searchActive
+                text: root.searchResults.length === 0
+                      ? (root.searchPending ? "…" : (root.searchText === "" ? "" : "0"))
+                      : ((root.searchResultIndex + 1) + " / " + root.searchResults.length
+                         + " pages · " + root.searchMatchCount + " highlights")
+                color: Theme.mutedForeground
+                font.pixelSize: 11
+                renderType: Text.QtRendering
+            }
+            HeaderButton {
+                visible: root.searchActive
+                label: "›"
+                tip: "next match page"
+                onActivated: root.runSearch(root.searchResults.length === 0, 1)
+            }
+
+            HeaderButton { label: "s"; tip: "search"; activeFlag: root.searchActive;
+                           onActivated: {
+                               root.searchActive = !root.searchActive
+                               if (root.searchActive) searchField.forceActiveFocus()
+                               else root.closeSearch()
+                           } }
+            HeaderButton { label: "T"; tip: "outline"; activeFlag: root.showOutline;
+                           onActivated: root.toggleOutline() }
+            HeaderButton { label: "c"; tip: "copy selection or page"; onActivated: root.copyPage() }
+            HeaderButton {
+                label: "ocr"
+                tip: Ocr.running ? "cancel recognition" : "recognize current page"
+                onActivated: {
+                    root.recognizeCurrentPage()
+                }
+            }
+            Text {
+                visible: Ocr.running || root.ocrStatus !== ""
+                text: Ocr.running ? (Ocr.progress + "%") : root.ocrStatus
+                color: Theme.mutedForeground
+                font.pixelSize: 10
+                elide: Text.ElideRight
+                Layout.maximumWidth: 130
+                renderType: Text.QtRendering
+            }
+            HeaderButton { label: "w"; tip: "fit width"; onActivated: root.fitWidth() }
+            HeaderButton { label: "p"; tip: "fit page"; onActivated: root.fitPage() }
+            HeaderButton { label: "1"; tip: "100%"; onActivated: root.zoom = 1.0 }
+            HeaderButton { label: "r"; tip: "rotate"; onActivated: root.rotateCW() }
+            HeaderButton { label: "t"; tip: "thumbnails"; activeFlag: root.showThumbs;
+                           onActivated: root.showThumbs = !root.showThumbs }
+            HeaderButton { label: "f"; tip: "fullscreen"; onActivated: root.toggleFullscreen() }
+            HeaderButton { label: "o"; tip: "open file"; onActivated: picker.open() }
+        }
+    }
+
+    // ---------- content ----------
+
+    RowLayout {
+        id: contentArea
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        spacing: 0
+
+        Loader {
+            active: root.showOutline
+            visible: active
+            Layout.preferredWidth: active ? 280 : 0
+            Layout.fillHeight: true
+            sourceComponent: Outline { }
+        }
+
+        Flickable {
+            id: view
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            clip: true
+            interactive: !root.spaceHeld && !root.selectionCanSelect(root.viewportSelection)
+            boundsBehavior: Flickable.StopAtBounds
+            contentWidth: Math.max(width, colW(zoom))
+            contentHeight: pagesCol.implicitHeight
+            onContentXChanged: root.refreshViewportSelection()
+            onContentYChanged: root.refreshViewportSelection()
+
+            Column {
+                id: pagesCol
+                x: colX(root.zoom)
+                width: colW(root.zoom)
+                spacing: 12
+                topPadding: 12
+                bottomPadding: 16
+                transform: Scale {
+                    origin.x: root.pinchAnchorContentX - pagesCol.x
+                    origin.y: root.pinchAnchorContentY - pagesCol.y
+                    xScale: root.pinchPreviewActive ? root.pinchPreviewScale : 1
+                    yScale: root.pinchPreviewActive ? root.pinchPreviewScale : 1
+                }
+
+                Repeater {
+                    id: pageRepeater
+                    model: Doc.pageCount
+                    delegate: Item {
+                        id: pageSlot
+                        width: pagesCol.width
+                        height: (root.sideways()
+                                 ? (root.pageSizes[index] ? root.pageSizes[index].width : 612)
+                                 : (root.pageSizes[index] ? root.pageSizes[index].height : 792))
+                                * root.zoom
+                        readonly property bool nearView: y + height >= view.contentY - 1000
+                                                         && y <= view.contentY + view.height
+                                                                 + (root.pinchPreviewActive ? 5000 : 2600)
+                        function mapViewPointToPage(viewPoint) {
+                            if (pageLoader.item)
+                                return pageLoader.item.mapViewPointToPage(viewPoint)
+                            const local = pageSlot.mapFromItem(view, viewPoint.x, viewPoint.y)
+                            const size = root.pageSizes[index]
+                            return Qt.point(Math.max(0, Math.min(size ? size.width : 612,
+                                                               local.x / root.zoom)),
+                                            Math.max(0, Math.min(size ? size.height : 792,
+                                                               local.y / root.zoom)))
+                        }
+
+                        Loader {
+                            id: pageLoader
+                            anchors.fill: parent
+                            active: root.pageLayoutReady && pageSlot.nearView
+                            sourceComponent: PageImage {
+                                page: index
+                                zoom: root.zoom
+                                rotationAngle: root.rotation
+                                dpr: root.dpr
+                                ptW: root.pageSizes[index] ? root.pageSizes[index].width : 612
+                                ptH: root.pageSizes[index] ? root.pageSizes[index].height : 792
+                            }
+                            onLoaded: {
+                                const capabilities = Object.assign({}, root.pageTextCapabilities)
+                                capabilities[index] = Doc.pageHasText(index)
+                                root.pageTextCapabilities = capabilities
+                            }
+                        }
+                    }
+                }
+            }
+
+            WheelHandler {
+                id: wheel
+                target: null
+                blocking: true
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                onWheel: (event) => {
+                    scrollMomentum.stop()
+                    if (event.modifiers & Qt.ControlModifier) {
+                        const d = event.angleDelta.y
+                        if (d === 0)
+                            return
+                        const a = root.anchorFrom(wheel.point.scenePosition,
+                                                  wheel.point.position)
+                        root.zoomAt(a.x, a.y, Math.pow(1.25, d / 120))
+                        return
+                    }
+
+                    // Direct scroll: touchpad pixel deltas are multiplied so a
+                    // small finger movement covers more ground; a mouse wheel
+                    // moves a fixed number of pixels per notch.
+                    const pixelFactor = 5.0
+                    const notchPx = 120.0
+                    let dx = event.pixelDelta.x * pixelFactor
+                    let dy = event.pixelDelta.y * pixelFactor
+                    if (dx === 0 && dy === 0) {
+                        dx = event.angleDelta.x / 120 * notchPx
+                        dy = event.angleDelta.y / 120 * notchPx
+                    }
+                    const maxX = Math.max(0, view.contentWidth - view.width)
+                    const maxY = Math.max(0, view.contentHeight - view.height)
+                    if (dx !== 0)
+                        view.contentX = Math.max(0, Math.min(view.contentX - dx, maxX))
+                    if (dy !== 0)
+                        view.contentY = Math.max(0, Math.min(view.contentY - dy, maxY))
+
+                    if (event.pixelDelta.x !== 0 || event.pixelDelta.y !== 0) {
+                        scrollMomentum.velocityX = scrollMomentum.velocityX * 0.4 - dx * 0.6
+                        scrollMomentum.velocityY = scrollMomentum.velocityY * 0.4 - dy * 0.6
+                        scrollEndDelay.restart()
+                        if (event.phase === Qt.ScrollEnd) {
+                            scrollEndDelay.stop()
+                            scrollMomentum.start()
+                        }
+                    }
+                }
+            }
+
+            Timer {
+                id: scrollEndDelay
+                interval: 55
+                onTriggered: scrollMomentum.start()
+            }
+
+            Timer {
+                id: scrollMomentum
+                interval: 16
+                repeat: true
+                property real velocityX: 0
+                property real velocityY: 0
+
+                function start() {
+                    if (Math.abs(velocityX) >= 0.5 || Math.abs(velocityY) >= 0.5)
+                        restart()
+                }
+
+                onTriggered: {
+                    const maxX = Math.max(0, view.contentWidth - view.width)
+                    const maxY = Math.max(0, view.contentHeight - view.height)
+                    const nextX = Math.max(0, Math.min(view.contentX + velocityX, maxX))
+                    const nextY = Math.max(0, Math.min(view.contentY + velocityY, maxY))
+                    const hitX = nextX === view.contentX && velocityX !== 0
+                    const hitY = nextY === view.contentY && velocityY !== 0
+                    view.contentX = nextX
+                    view.contentY = nextY
+                    velocityX = hitX ? 0 : velocityX * 0.95
+                    velocityY = hitY ? 0 : velocityY * 0.95
+                    if (Math.abs(velocityX) < 0.5 && Math.abs(velocityY) < 0.5)
+                        stop()
+                }
+            }
+
+            PinchHandler {
+                id: pinch
+                target: null
+                property real startZoom: 1
+                onActiveChanged: {
+                    if (active) {
+                        scrollEndDelay.stop()
+                        scrollMomentum.stop()
+                        scrollMomentum.velocityX = 0
+                        scrollMomentum.velocityY = 0
+                        const a = root.anchorFrom(centroid.scenePosition, centroid.position)
+                        startZoom = root.zoom
+                        root.pinchAnchorViewportX = a.x
+                        root.pinchAnchorViewportY = a.y
+                        root.pinchAnchorContentX = view.contentX + a.x
+                        root.pinchAnchorContentY = view.contentY + a.y
+                        const cw = root.colW(startZoom)
+                        root.pinchAnchorColumnFraction = cw > 0
+                            ? (root.pinchAnchorContentX - root.colX(startZoom)) / cw : 0.5
+                        root.pinchAnchorPage = root.pageCount > 0
+                            ? Math.max(0, root.currentPage - 1) : 0
+                        for (let i = 0; i < root.pageCount; ++i) {
+                            const top = root.pageTopAt(i, startZoom)
+                            const h = root.sheetHpt(i) * startZoom
+                            if (root.pinchAnchorContentY < top + h) {
+                                root.pinchAnchorPage = i
+                                root.pinchAnchorPageFraction = h > 0
+                                    ? Math.max(0, Math.min(1,
+                                        (root.pinchAnchorContentY - top) / h)) : 0
+                                break
+                            }
+                        }
+                        root.pinchPreviewScale = 1
+                        root.pinchPreviewActive = true
+                    } else if (root.pinchPreviewActive) {
+                        const targetZoom = root.clampZoom(startZoom * root.pinchPreviewScale)
+                        const cw = root.colW(targetZoom)
+                        const newCx = root.colX(targetZoom)
+                                    + root.pinchAnchorColumnFraction * cw
+                        const newCy = root.pageTopAt(root.pinchAnchorPage, targetZoom)
+                                    + root.pinchAnchorPageFraction
+                                      * root.sheetHpt(root.pinchAnchorPage) * targetZoom
+                        root.zoom = targetZoom
+                        view.contentX = Math.max(0, Math.min(
+                            newCx - root.pinchAnchorViewportX,
+                            Math.max(0, Math.max(view.width, cw) - view.width)))
+                        view.contentY = Math.max(0, Math.min(
+                            newCy - root.pinchAnchorViewportY,
+                            Math.max(0, root.totalH(targetZoom) - view.height)))
+                        root.pinchPreviewActive = false
+                        root.pinchPreviewScale = 1
+                    }
+                }
+                onActiveScaleChanged: {
+                    if (!active)
+                        return
+                    const a = root.anchorFrom(centroid.scenePosition, centroid.position)
+                    root.pinchAnchorViewportX = a.x
+                    root.pinchAnchorViewportY = a.y
+                    const targetZoom = root.clampZoom(startZoom * activeScale)
+                    root.pinchPreviewScale = targetZoom / startZoom
+                    const maxX = Math.max(0, Math.max(view.width, root.colW(targetZoom))
+                                                   - view.width)
+                    const maxY = Math.max(0, root.totalH(targetZoom) - view.height)
+                    view.contentX = Math.max(0, Math.min(
+                        root.pinchAnchorContentX - a.x, maxX))
+                    view.contentY = Math.max(0, Math.min(
+                        root.pinchAnchorContentY - a.y, maxY))
+                }
+            }
+
+            DragHandler {
+                id: rangeSelection
+                property var anchorSelection: null
+                property point lastPoint: Qt.point(0, 0)
+                property string selectionSource: "native"
+                acceptedButtons: Qt.LeftButton
+                enabled: !root.spaceHeld
+                         && (active || root.selectionCanSelect(root.viewportSelection))
+                target: null
+
+                function refresh(point) {
+                    const viewportPoint = view.mapFromItem(rangeSelection.parent,
+                                                           point.x, point.y)
+                    refreshViewport(viewportPoint)
+                }
+
+                function refreshViewport(viewportPoint) {
+                    lastPoint = viewportPoint
+                    const focus = root.selectionPoint(viewportPoint)
+                    if (active && anchorSelection && focus)
+                        root.updateSelection(anchorSelection.page, anchorSelection.point,
+                                             focus.page, focus.point, selectionSource)
+                }
+
+                onActiveChanged: {
+                    if (active) {
+                        const viewportPoint = view.mapFromItem(rangeSelection.parent,
+                                                               centroid.pressPosition.x,
+                                                               centroid.pressPosition.y)
+                        lastPoint = view.mapFromItem(rangeSelection.parent,
+                                                     centroid.position.x,
+                                                     centroid.position.y)
+                        anchorSelection = root.selectionPoint(viewportPoint)
+                        selectionSource = anchorSelection && root.ocrPages[anchorSelection.page]
+                            && (!root.ocrPages[anchorSelection.page].embeddedText
+                                || root.pointInsideOcrWord(anchorSelection.page,
+                                                           anchorSelection.point) >= 0)
+                            ? "ocr" : "native"
+                        root.clearSelection()
+                        root.requestRegionalOcr(anchorSelection)
+                    } else {
+                        const focus = root.selectionPoint(lastPoint)
+                        if (anchorSelection && focus)
+                            root.updateSelection(anchorSelection.page, anchorSelection.point,
+                                                 focus.page, focus.point, selectionSource)
+                        anchorSelection = null
+                    }
+                }
+                onCentroidChanged: if (active) refresh(centroid.position)
+            }
+
+            DragHandler {
+                id: spacePan
+                target: null
+                acceptedButtons: Qt.LeftButton
+                enabled: root.spaceHeld
+                property real startContentX: 0
+                property real startContentY: 0
+
+                onActiveChanged: if (active) {
+                    scrollEndDelay.stop()
+                    scrollMomentum.stop()
+                    startContentX = view.contentX
+                    startContentY = view.contentY
+                }
+                onTranslationChanged: if (active) {
+                    const maxX = Math.max(0, view.contentWidth - view.width)
+                    const maxY = Math.max(0, view.contentHeight - view.height)
+                    view.contentX = Math.max(0, Math.min(startContentX - translation.x, maxX))
+                    view.contentY = Math.max(0, Math.min(startContentY - translation.y, maxY))
+                }
+            }
+
+            Timer {
+                id: selectionAutoScroll
+                interval: 16
+                repeat: true
+                running: rangeSelection.active
+                         && (rangeSelection.lastPoint.x < 48
+                             || rangeSelection.lastPoint.x > view.width - 48
+                             || rangeSelection.lastPoint.y < 48
+                             || rangeSelection.lastPoint.y > view.height - 48)
+                onTriggered: {
+                    const edge = 48
+                    let deltaX = 0
+                    let deltaY = 0
+                    if (rangeSelection.lastPoint.x < edge)
+                        deltaX = -Math.min(24, edge - rangeSelection.lastPoint.x)
+                    else if (rangeSelection.lastPoint.x > view.width - edge)
+                        deltaX = Math.min(24, rangeSelection.lastPoint.x - (view.width - edge))
+                    if (rangeSelection.lastPoint.y < edge)
+                        deltaY = -Math.min(24, edge - rangeSelection.lastPoint.y)
+                    else if (rangeSelection.lastPoint.y > view.height - edge)
+                        deltaY = Math.min(24, rangeSelection.lastPoint.y - (view.height - edge))
+                    const maxX = Math.max(0, view.contentWidth - view.width)
+                    const maxY = Math.max(0, view.contentHeight - view.height)
+                    view.contentX = Math.max(0, Math.min(view.contentX + deltaX, maxX))
+                    view.contentY = Math.max(0, Math.min(view.contentY + deltaY, maxY))
+                    rangeSelection.refreshViewport(rangeSelection.lastPoint)
+                }
+            }
+
+            HoverHandler {
+                id: hoveredPage
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                onPointChanged: {
+                    root.viewportPointer = view.mapFromItem(
+                        null, point.scenePosition.x, point.scenePosition.y)
+                    root.refreshViewportSelection()
+                    regionHoverTimer.restart()
+                    if (point.pressedButtons & Qt.LeftButton)
+                        root.requestRegionalOcr(root.viewportSelection)
+                }
+                onHoveredChanged: if (!hovered) {
+                    root.viewportPointer = Qt.point(-1, -1)
+                    root.viewportSelection = null
+                    root.viewportHasNativeText = false
+                }
+            }
+
+            Timer {
+                id: regionHoverTimer
+                interval: 550
+                onTriggered: root.requestRegionalOcr(root.viewportSelection)
+            }
+
+            HoverHandler {
+                id: viewportCursor
+                acceptedDevices: PointerDevice.Mouse | PointerDevice.TouchPad
+                cursorShape: spacePan.active || view.dragging ? Qt.ClosedHandCursor
+                                          : root.spaceHeld ? Qt.OpenHandCursor
+                                          : root.selectionCanSelect(root.viewportSelection)
+                                            ? Qt.IBeamCursor
+                                            : root.viewportSelection ? Qt.OpenHandCursor
+                                            : Qt.ArrowCursor
+            }
+        }
+
+        Loader {
+            active: root.showThumbs && root.pageCount > 1
+            visible: active
+            Layout.preferredWidth: active ? 148 : 0
+            Layout.fillHeight: true
+            sourceComponent: Thumbnails { }
+        }
+    }
+
+    NumberAnimation {
+        id: jumpAnim
+        target: view
+        property: "contentY"
+        duration: 300
+        easing.type: Easing.OutCubic
+    }
+
+    // ---------- empty state ----------
+
+    Rectangle {
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        visible: root.pageCount === 0
+        color: Theme.background
+
+        Column {
+            anchors.centerIn: parent
+            spacing: 8
+
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "glance"
+                color: Theme.foreground
+                font.pixelSize: 28
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1
+                renderType: Text.QtRendering
+            }
+            Text {
+                anchors.horizontalCenter: parent.horizontalCenter
+                text: "press o or drop a file here"
+                color: Theme.mutedForeground
+                font.pixelSize: 14
+                renderType: Text.QtRendering
+            }
+        }
+        MouseArea {
+            anchors.fill: parent
+            onClicked: picker.open()
+        }
+    }
+
+    DropArea {
+        anchors.fill: parent
+        onDropped: (drop) => {
+            if (root.pageCount > 0)
+                return // one file per window, per spec
+            if (drop.urls.length > 0)
+                root.openFromUrl(drop.urls[0])
+        }
+    }
+
+    FileDialog {
+        id: picker
+        nameFilters: ["Documents (*.pdf *.png *.jpeg *.jpg *.gif *.webp *.bmp *.tiff *.tif)"]
+        onAccepted: root.openFromUrl(currentFile)
+    }
+
+    // ---------- shortcuts ----------
+    // Single-key shortcuts are disabled while the search field has focus so
+    // typing doesn't trigger navigation (or quit!).
+    readonly property bool typing: searchField.activeFocus
+
+    Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
+    Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
+    Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
+               onActivated: root.recognizeCurrentPage() }
+    Shortcut { sequence: "Escape"; onActivated: {
+        if (root.searchActive)
+            root.closeSearch()
+        else
+            root.clearSelection()
+    } }
+    Shortcut { sequence: "q"; enabled: !root.typing; onActivated: Qt.quit() }
+    Shortcut { sequence: "Ctrl+f"; onActivated: {
+        root.searchActive = true
+        searchField.forceActiveFocus()
+        searchField.selectAll()
+    } }
+    Shortcut { sequence: "n"; enabled: root.searchActive && !root.typing;
+               onActivated: root.runSearch(false, 1) }
+    Shortcut { sequence: "Shift+n"; enabled: root.searchActive && !root.typing;
+               onActivated: root.runSearch(false, -1) }
+    Shortcut { sequence: "T"; enabled: !root.typing; onActivated: root.toggleOutline() }
+    Shortcut { sequence: "c"; enabled: !root.typing; onActivated: root.copyPage() }
+    Shortcut { sequence: "f"; enabled: !root.typing; onActivated: root.toggleFullscreen() }
+    Shortcut { sequence: "F11"; onActivated: root.toggleFullscreen() }
+    Shortcut { sequence: "j"; enabled: !root.typing; onActivated: root.jumpTo(root.currentPage + 1, false) }
+    Shortcut { sequence: "k"; enabled: !root.typing; onActivated: root.jumpTo(root.currentPage - 1, false) }
+    Shortcut { sequence: "d"; enabled: !root.typing; onActivated: view.contentY = Math.min(
+                  view.contentY + view.height / 2,
+                  Math.max(0, view.contentHeight - view.height)) }
+    Shortcut { sequence: "u"; enabled: !root.typing; onActivated: view.contentY = Math.max(0,
+                  view.contentY - view.height / 2) }
+    Shortcut { sequence: "g"; enabled: !root.typing; onActivated: root.jumpTo(1, false) }
+    Shortcut { sequence: "G"; enabled: !root.typing; onActivated: root.jumpTo(root.pageCount, false) }
+    Shortcut { sequence: "="; enabled: !root.typing; onActivated: root.zoomAt(view.width / 2, view.height / 2, 1.25) }
+    Shortcut { sequence: "-"; enabled: !root.typing; onActivated: root.zoomAt(view.width / 2, view.height / 2, 0.8) }
+    Shortcut { sequence: "w"; enabled: !root.typing; onActivated: root.fitWidth() }
+    Shortcut { sequence: "p"; enabled: !root.typing; onActivated: root.fitPage() }
+    Shortcut { sequence: "1"; enabled: !root.typing; onActivated: root.zoom = 1.0 }
+    Shortcut { sequence: "r"; enabled: !root.typing; onActivated: root.rotateCW() }
+    Shortcut { sequence: "t"; enabled: !root.typing; onActivated: root.showThumbs = !root.showThumbs }
+    Shortcut { sequence: "o"; enabled: !root.typing; onActivated: picker.open() }
+
+    // ---------- lifecycle ----------
+
+    Component.onCompleted: {
+        computeSizes()
+        pageLayoutReadyTimer.start()
+        if (Qt.application.arguments.indexOf("--perf") !== -1)
+            perfStart.start()
+    }
+    onPageCountChanged: {
+        Ocr.cancel()
+        ocrGeneration += 1
+        ocrPages = ({})
+        ocrRegionKeys = ({})
+        nativeHoverCache = ({})
+        nativePageBoxes = ({})
+        pendingOcrRegion = null
+        ocrStatus = ""
+        pageLayoutReady = false
+        computeSizes()
+        pageLayoutReadyTimer.restart()
+        prefetchAround()
+        scheduleVisibleOcr()
+    }
+
+    Timer {
+        id: pageLayoutReadyTimer
+        interval: 0
+        onTriggered: root.pageLayoutReady = true
+    }
+    Connections {
+        target: view
+        function onWidthChanged(w) {
+            if ((!root.initialFitDone || root.autoFitSinglePage) && root.pageCount > 0)
+                root.fitWidth(true)
+        }
+    }
+    onCurrentPageChanged: {
+        prefetchAround()
+        nearbyOcrTimer.stop()
+        if (Ocr.running && ocrRequestedPage !== currentPage - 1) {
+            Ocr.cancel()
+            ocrGeneration += 1
+            ocrRequestedPage = -1
+        }
+        scheduleVisibleOcr()
+    }
+
+    // ---------- temporary perf probe (--perf) ----------
+    FrameAnimation {
+        id: perfFramesAnim
+        running: false
+        property real lastT: 0
+        onTriggered: {
+            root.perfFrames += 1
+            if (lastT > 0) {
+                const dt = nowMs() - lastT
+                if (dt > 20)
+                    console.log("GLANCE DROP " + Math.round(dt) + "ms")
+            }
+            lastT = nowMs()
+        }
+    }
+    NumberAnimation {
+        id: perfZoomAnim
+        target: root
+        property: "zoom"
+        from: 1.0
+        to: 3.0
+        duration: 3000
+        easing.type: Easing.InOutSine
+    }
+    FrameAnimation {
+        id: perfPinchAnim
+        running: false
+        property real startedAt: 0
+        onTriggered: {
+            const elapsed = nowMs() - startedAt
+            root.pinchPreviewScale = 1 + Math.min(1, elapsed / 3000)
+        }
+    }
+    NumberAnimation {
+        id: perfScrollAnim
+        target: view
+        property: "contentY"
+        from: 0
+        to: 20000
+        duration: 3000
+        easing.type: Easing.Linear
+    }
+    Timer { id: perfStart; interval: 1500; onTriggered: {
+        root.perfFrames = 0
+        perfFramesAnim.running = true
+        root.pinchAnchorViewportX = view.width / 2
+        root.pinchAnchorViewportY = view.height / 2
+        root.pinchAnchorContentX = view.contentX + view.width / 2
+        root.pinchAnchorContentY = view.contentY + view.height / 2
+        root.pinchPreviewScale = 1
+        root.pinchPreviewActive = true
+        perfPinchAnim.startedAt = nowMs()
+        perfPinchAnim.running = true
+        perfStopZoom.restart()
+    } }
+    Timer { id: perfStopZoom; interval: 3000; onTriggered: {
+        console.log("PERF pinch fps=" + (root.perfFrames / 3.0).toFixed(1))
+        perfPinchAnim.running = false
+        const factor = root.pinchPreviewScale
+        root.pinchPreviewActive = false
+        root.pinchPreviewScale = 1
+        root.zoomAt(root.pinchAnchorViewportX, root.pinchAnchorViewportY, factor)
+        root.perfFrames = 0
+        perfScrollAnim.restart()
+        perfStopScroll.restart()
+    } }
+    Timer { id: perfStopScroll; interval: 3000; onTriggered: {
+        perfFramesAnim.running = false
+        console.log("PERF scroll fps=" + (root.perfFrames / 3.0).toFixed(1))
+    } }
+}

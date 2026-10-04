@@ -1,0 +1,3 @@
+build/
+*.a
+third_party/mupdf/build/

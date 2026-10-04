@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fffefa"/>
+      <stop offset="1" stop-color="#f0f0eb"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="14" stdDeviation="13" flood-color="#111923" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <rect x="22" y="22" width="468" height="468" rx="108" fill="url(#tile)"/>
+
+  <g fill="none" stroke="#121a27" stroke-width="24" stroke-linecap="round"
+     stroke-linejoin="round" filter="url(#shadow)">
+    <path d="M111 71h202l88 88v274c0 17-14 31-31 31H142c-17 0-31-14-31-31V102c0-17 14-31 31-31z"/>
+    <path d="M313 71v60c0 17 14 31 31 31h57"/>
+  </g>
+
+  <path d="M62 271c47-65 112-98 194-98s147 33 194 98c-47 65-112 98-194 98S109 336 62 271z"
+        fill="#fffefa" stroke="#121a27" stroke-width="25" stroke-linejoin="round"/>
+  <circle cx="256" cy="271" r="65" fill="#121a27"/>
+  <circle cx="234" cy="245" r="20" fill="#fffefa"/>
+</svg>

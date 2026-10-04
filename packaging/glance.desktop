@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=Glance
+GenericName=Document Viewer
+Comment=Fast PDF and image viewer with selectable text and OCR
+Exec=glance %f
+Icon=glance
+Terminal=false
+Categories=Viewer;Graphics;
+MimeType=application/pdf;image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;
+Keywords=PDF;Image;Viewer;OCR;Document;
+StartupWMClass=glance
+StartupNotify=true
+X-GNOME-UsesNotifications=false
