@@ -53,6 +53,8 @@ Window {
     property point viewportPointer: Qt.point(-1, -1)
     property var viewportSelection: null
     property bool viewportHasNativeText: false
+    property int resumeFullPageOcr: -1
+    property string hoverRegionKey: ""
     property int perfFrames: 0
     property var pageSizes: []
     property var prefixHpt: []   // cumulative ptH before page i (upright)
@@ -606,10 +608,13 @@ Window {
                 ocrGeneration += 1
                 ocrRequestedPage = -1
                 ocrStatus = "recognition cancelled"
+            } else if (ocrRequestedPage < 0) {
+                resumeFullPageOcr = page
             }
             return false
         }
-        if (page < 0 || page >= pageCount || ocrPages[page] !== undefined)
+        if (page < 0 || page >= pageCount
+                || (ocrPages[page] !== undefined && !ocrPages[page].partial))
             return false
         const hasText = Doc.pageHasText(page)
         const capabilities = Object.assign({}, pageTextCapabilities)
@@ -684,16 +689,21 @@ Window {
         if (!selection)
             return false
         const hasNativeText = pageTextCapabilities[selection.page] === true
-        if (!hasNativeText && !ocrPages[selection.page])
-            return false
         if (hasNativeText && nativePointHasText(selection.page, selection.point))
             return false
         if (Ocr.running) {
-            if (ocrRequestedPage < 0 || ocrRequestedPage === selection.page)
+            if (ocrRequestedPage < 0)
                 return false
-            Ocr.cancel()
-            ocrGeneration += 1
-            ocrRequestedPage = -1
+            if (ocrRequestedPage === selection.page) {
+                root.resumeFullPageOcr = selection.page
+                Ocr.cancel()
+                ocrGeneration += 1
+                ocrRequestedPage = -1
+            } else {
+                Ocr.cancel()
+                ocrGeneration += 1
+                ocrRequestedPage = -1
+            }
         }
         const point = selection.point
         const words = ocrPages[selection.page] ? ocrPages[selection.page].words : []
@@ -703,13 +713,10 @@ Window {
                     && point.y >= word.y - 6 && point.y <= word.y + word.h + 6)
                 return false
         }
-        const size = Doc.pageSizePt(selection.page)
-        const width = Math.min(100, size.width)
-        const height = Math.min(40, size.height)
-        const x = Math.max(0, Math.min(size.width - width, point.x - width / 2))
-        const y = Math.max(0, Math.min(size.height - height, point.y - height / 2))
-        const region = Qt.rect(x, y, width, height)
-        const key = selection.page + ":" + Math.round(x / 34) + ":" + Math.round(y / 16)
+        const geometry = regionalOcrGeometry(selection)
+        const size = geometry.size
+        const region = geometry.region
+        const key = geometry.key
         if (ocrRegionKeys[key])
             return false
         const keys = Object.assign({}, ocrRegionKeys)
@@ -719,6 +726,22 @@ Window {
         ocrGeneration += 1
         Ocr.recognizeRegion(Doc.filePath, selection.page, size, region, ocrGeneration)
         return true
+    }
+
+    function regionalOcrGeometry(selection) {
+        if (!selection)
+            return { key: "", region: Qt.rect(0, 0, 0, 0), size: Qt.size(0, 0) }
+        const size = Doc.pageSizePt(selection.page)
+        const width = Math.min(100, size.width)
+        const height = Math.min(40, size.height)
+        const rawX = Math.max(0, Math.min(size.width - width,
+                                         selection.point.x - width / 2))
+        const rawY = Math.max(0, Math.min(size.height - height,
+                                         selection.point.y - height / 2))
+        const x = Math.max(0, Math.min(size.width - width, Math.round(rawX / 50) * 50))
+        const y = Math.max(0, Math.min(size.height - height, Math.round(rawY / 20) * 20))
+        return { key: selection.page + ":" + x + ":" + y,
+                 region: Qt.rect(x, y, width, height), size: size }
     }
 
     Connections {
@@ -748,7 +771,7 @@ Window {
             }
             const pages = Object.assign({}, root.ocrPages)
             pages[page] = { text: root.ocrText(filteredWords), words: filteredWords,
-                            embeddedText: embeddedText }
+                            embeddedText: embeddedText, partial: false }
             root.ocrPages = pages
             root.refreshViewportSelection()
             const capabilities = Object.assign({}, root.pageTextCapabilities)
@@ -758,13 +781,29 @@ Window {
                 root.ocrStatus = words.length + " words recognized"
             root.ocrRequestedPage = -1
             nearbyOcrTimer.restart()
+            if (root.viewportPointer.x >= 0)
+                regionHoverTimer.restart()
         }
         function onRegionFinished(generation, page, region, words, error) {
             if (generation !== root.ocrGeneration)
                 return
             root.pendingOcrRegion = null
+            if (root.resumeFullPageOcr >= 0) {
+                const resumePage = root.resumeFullPageOcr
+                root.resumeFullPageOcr = -1
+                fullPageOcrResume.page = resumePage
+                fullPageOcrResume.restart()
+            }
             if (error !== "")
+            {
+                const geometry = root.regionalOcrGeometry(
+                    { page: page, point: Qt.point(region.x + region.width / 2,
+                                                   region.y + region.height / 2) })
+                const keys = Object.assign({}, root.ocrRegionKeys)
+                delete keys[geometry.key]
+                root.ocrRegionKeys = keys
                 return
+            }
             const previous = root.ocrPages[page]
             const merged = previous ? previous.words.slice() : []
             for (let i = 0; i < words.length; ++i) {
@@ -798,15 +837,18 @@ Window {
             const pages = Object.assign({}, root.ocrPages)
             pages[page] = { text: root.ocrText(merged),
                             words: merged,
-                            embeddedText: root.pageTextCapabilities[page] === true }
+                            embeddedText: root.pageTextCapabilities[page] === true,
+                            partial: !previous || previous.partial === true }
             root.ocrPages = pages
             root.refreshViewportSelection()
+            if (root.viewportPointer.x >= 0)
+                regionHoverTimer.restart()
         }
     }
 
     Timer {
         id: autoOcrTimer
-        interval: 350
+        interval: 120
         onTriggered: root.requestOcr(Math.max(0, root.currentPage - 1), false)
     }
 
@@ -817,6 +859,18 @@ Window {
             const page = Math.max(0, root.currentPage - 1)
             if (!root.requestOcr(page + 1, false))
                 root.requestOcr(page - 1, false)
+        }
+    }
+
+    Timer {
+        id: fullPageOcrResume
+        interval: 300
+        property int page: -1
+        onTriggered: {
+            if (page >= 0 && !Ocr.running
+                    && (root.ocrPages[page] === undefined || root.ocrPages[page].partial))
+                root.requestOcr(page, false)
+            page = -1
         }
     }
 
@@ -1396,7 +1450,14 @@ Window {
                     root.viewportPointer = view.mapFromItem(
                         null, point.scenePosition.x, point.scenePosition.y)
                     root.refreshViewportSelection()
-                    regionHoverTimer.restart()
+                    if (root.viewportSelection && !root.viewportHasNativeText)
+                        Ocr.prewarm()
+                    const nextRegionKey = root.regionalOcrGeometry(
+                        root.viewportSelection).key
+                    if (nextRegionKey !== root.hoverRegionKey) {
+                        root.hoverRegionKey = nextRegionKey
+                        regionHoverTimer.restart()
+                    }
                     if (point.pressedButtons & Qt.LeftButton)
                         root.requestRegionalOcr(root.viewportSelection)
                 }
@@ -1404,12 +1465,13 @@ Window {
                     root.viewportPointer = Qt.point(-1, -1)
                     root.viewportSelection = null
                     root.viewportHasNativeText = false
+                    root.hoverRegionKey = ""
                 }
             }
 
             Timer {
                 id: regionHoverTimer
-                interval: 550
+                interval: 40
                 onTriggered: root.requestRegionalOcr(root.viewportSelection)
             }
 
@@ -1558,6 +1620,7 @@ Window {
         nativeHoverCache = ({})
         nativePageBoxes = ({})
         pendingOcrRegion = null
+        hoverRegionKey = ""
         ocrStatus = ""
         pageLayoutReady = false
         computeSizes()

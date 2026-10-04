@@ -29,9 +29,12 @@ cd glance
 ./build/glance file.pdf
 ```
 
-Arch build dependencies: `base-devel cmake ninja qt6-base qt6-declarative`.
-Runtime OCR dependencies: `poppler tesseract tesseract-data-eng`. OCR currently
-uses English language data.
+Arch build dependencies: `base-devel cmake ninja pkgconf qt6-base
+qt6-declarative tesseract`. Runtime OCR dependencies: `poppler tesseract
+tesseract-data-eng` and Python 3.10-3.12 for RapidOCR. OCR currently uses
+English language data. The user installer creates an isolated RapidOCR runtime;
+set `GLANCE_PYTHON` when the compatible Python executable is not on `PATH`.
+Source-tree runs can set `GLANCE_RAPIDOCR_PYTHON` to the runtime interpreter.
 
 ## Install
 

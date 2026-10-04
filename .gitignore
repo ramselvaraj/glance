@@ -1,3 +1,5 @@
 build/
+__pycache__/
+*.pyc
 *.a
 third_party/mupdf/build/

@@ -6,6 +6,9 @@ bin_home=${XDG_BIN_HOME:-"$HOME/.local/bin"}
 
 rm -f "$bin_home/glance"
 rm -f "$HOME/.local/lib/glance/glance"
+rm -f "$HOME/.local/lib/glance/glance-ocr-worker"
+rm -f "$HOME/.local/lib/glance/glance-rapidocr-worker"
+rm -rf "$HOME/.local/lib/glance/ocr-runtime"
 rm -rf "$HOME/.local/lib/glance/qml"
 rmdir "$HOME/.local/lib/glance" 2>/dev/null || true
 rm -f "$data_home/applications/glance.desktop"

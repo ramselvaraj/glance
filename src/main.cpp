@@ -42,8 +42,13 @@ int main(int argc, char *argv[])
                                QStringLiteral("Print outline/search diagnostics and exit"));
     parser.addOption(selfOpt);
     QCommandLineOption ocrSelfOpt(QStringLiteral("ocr-selftest"),
-                                  QStringLiteral("Recognize the first page and exit"));
+                                   QStringLiteral("Recognize a page and exit"),
+                                   QStringLiteral("page"), QStringLiteral("1"));
     parser.addOption(ocrSelfOpt);
+    QCommandLineOption ocrCancelSelfOpt(QStringLiteral("ocr-cancel-selftest"),
+                                        QStringLiteral("Cancel and restart page recognition"),
+                                        QStringLiteral("page"), QStringLiteral("1"));
+    parser.addOption(ocrCancelSelfOpt);
     parser.addPositionalArgument("file", "Document to open (pdf/images). Optional.");
     parser.process(app);
 
@@ -90,27 +95,49 @@ int main(int argc, char *argv[])
     InputState input;
     app.installEventFilter(&input);
 
-    if (parser.isSet(ocrSelfOpt)) {
+    if (parser.isSet(ocrSelfOpt) || parser.isSet(ocrCancelSelfOpt)) {
         if (filePath.isEmpty() || !doc->isOpen())
+            return 1;
+        const bool cancelTest = parser.isSet(ocrCancelSelfOpt);
+        if (cancelTest)
+            ocr.setCacheEnabled(false);
+        bool pageOk = false;
+        const int ocrPage = parser.value(cancelTest ? ocrCancelSelfOpt : ocrSelfOpt)
+            .toInt(&pageOk) - 1;
+        if (!pageOk || ocrPage < 0 || ocrPage >= doc->pageCount())
             return 1;
         auto *timer = new QElapsedTimer;
         auto *pass = new int(0);
         timer->start();
         QObject::connect(&ocr, &OcrManager::finished, &app,
-                         [&app, &ocr, doc, filePath, timer, pass](int, int page, const QString &text,
-                                const QVariantList &words, const QString &error) {
+                         [&app, &ocr, doc, filePath, ocrPage, cancelTest, timer, pass](int generation, int page, const QString &text,
+                                 const QVariantList &words, const QString &error) {
+            if (cancelTest && generation != 2)
+                return;
             fprintf(stderr, "ocr-selftest: pass=%d page=%d chars=%d words=%d ms=%lld error='%s'\n",
                     *pass + 1,
                     page + 1, int(text.size()), int(words.size()),
                     static_cast<long long>(timer->elapsed()),
                     error.toUtf8().constData());
-            if (!error.isEmpty() || words.isEmpty()) {
+            int characterCount = 0;
+            bool charactersMatch = true;
+            for (const QVariant &value : words) {
+                const QVariantMap word = value.toMap();
+                QString characterText;
+                for (const QVariant &character : word.value(QStringLiteral("chars")).toList())
+                    characterText += character.toMap().value(QStringLiteral("text")).toString();
+                characterCount += characterText.size();
+                if (!characterText.isEmpty() && characterText != word.value(QStringLiteral("text")).toString())
+                    charactersMatch = false;
+            }
+            fprintf(stderr, "ocr-selftest: character-boxes=%d\n", characterCount);
+            if (!error.isEmpty() || words.isEmpty() || characterCount == 0 || !charactersMatch) {
                 app.exit(2);
                 return;
             }
-            if ((*pass)++ == 0) {
+            if (!cancelTest && (*pass)++ == 0) {
                 timer->restart();
-                ocr.recognize(filePath, 0, doc->pageSizePt(0), 2);
+                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2);
                 return;
             }
             app.exit(0);
@@ -119,7 +146,14 @@ int main(int argc, char *argv[])
             ocr.cancel();
             app.exit(3);
         });
-        ocr.recognize(filePath, 0, doc->pageSizePt(0), 1);
+        ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 1);
+        if (cancelTest) {
+            QTimer::singleShot(25, &app, [&ocr, doc, filePath, ocrPage, timer] {
+                ocr.cancel();
+                timer->restart();
+                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2);
+            });
+        }
         return app.exec();
     }
 

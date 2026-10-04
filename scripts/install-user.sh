@@ -12,6 +12,12 @@ icon_dir="$data_home/icons/hicolor/scalable/apps"
 
 mkdir -p "$lib_dir" "$bin_home" "$desktop_dir" "$icon_dir"
 install -m 755 "$repo_dir/build/glance" "$lib_dir/glance"
+install -m 755 "$repo_dir/build/glance-ocr-worker" "$lib_dir/glance-ocr-worker"
+install -m 755 "$repo_dir/scripts/rapidocr-worker.py" "$lib_dir/glance-rapidocr-worker"
+if [ ! -x "$lib_dir/ocr-runtime/bin/python" ] \
+        || ! "$lib_dir/ocr-runtime/bin/python" -c 'import rapidocr, onnxruntime' >/dev/null 2>&1; then
+    sh "$repo_dir/scripts/setup-rapidocr.sh" "$lib_dir/ocr-runtime"
+fi
 rm -rf "$lib_dir/qml"
 cp -R "$repo_dir/qml" "$lib_dir/qml"
 find "$lib_dir/qml" -type f -exec chmod 644 {} +

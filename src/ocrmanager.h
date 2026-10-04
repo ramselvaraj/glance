@@ -15,6 +15,7 @@ class OcrManager : public QObject {
 
 public:
     explicit OcrManager(QObject *parent = nullptr);
+    ~OcrManager() override;
 
     bool running() const { return m_running; }
     int progress() const { return m_progress; }
@@ -24,6 +25,8 @@ public:
     Q_INVOKABLE void recognizeRegion(const QString &path, int page, QSizeF pageSize,
                                      QRectF region, int generation);
     Q_INVOKABLE void cancel();
+    Q_INVOKABLE void prewarm();
+    void setCacheEnabled(bool enabled) { m_cacheEnabled = enabled; }
 
 signals:
     void runningChanged();
@@ -37,9 +40,13 @@ private:
     struct Result { QString text; QVariantList words; };
     void setRunning(bool running);
     void setProgress(int progress);
+    void startRecognition();
+    void connectWorker();
     void startTesseract();
     void finishWithError(const QString &error);
     void parseTsv();
+    bool startWorkerRequest();
+    void handleWorkerOutput();
     void begin(const QString &path, int page, QSizeF pageSize, int generation);
     bool loadCached(const QString &key, Result &result) const;
     void saveCached(const QString &key, const Result &result) const;
@@ -47,6 +54,12 @@ private:
     void pruneCache() const;
 
     QProcess m_process;
+    QProcess m_worker;
+    QByteArray m_workerBuffer;
+    bool m_workerRequestActive = false;
+    bool m_workerAvailable = false;
+    bool m_workerFailed = false;
+    bool m_workerIsRapid = false;
     QTemporaryDir m_tempDir;
     QString m_path;
     QSizeF m_pageSize;
@@ -64,4 +77,6 @@ private:
     enum class Stage { Idle, Rendering, Recognizing } m_stage = Stage::Idle;
     QString m_cacheKey;
     QHash<QString, Result> m_cache;
+    mutable bool m_cachePruned = false;
+    bool m_cacheEnabled = true;
 };

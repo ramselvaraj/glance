@@ -10,6 +10,8 @@
 #include <QDir>
 #include <QSaveFile>
 #include <QStandardPaths>
+#include <QCoreApplication>
+#include <QProcessEnvironment>
 #include <limits>
 #include <QTextStream>
 
@@ -26,23 +28,78 @@ OcrManager::OcrManager(QObject *parent)
         }
         if (m_stage == Stage::Rendering) {
             setProgress(45);
-            startTesseract();
+            startRecognition();
         } else {
             setProgress(95);
             parseTsv();
         }
     });
+    const QString applicationDir = QCoreApplication::applicationDirPath();
+    const QString configuredPython = QProcessEnvironment::systemEnvironment()
+        .value(QStringLiteral("GLANCE_RAPIDOCR_PYTHON"));
+    const QString rapidPython = configuredPython.isEmpty()
+        ? applicationDir + QStringLiteral("/ocr-runtime/bin/python")
+        : configuredPython;
+    QString rapidWorker = applicationDir + QStringLiteral("/glance-rapidocr-worker");
+    if (!QFileInfo::exists(rapidWorker))
+        rapidWorker = QStringLiteral(RAPIDOCR_WORKER_SOURCE_S);
+    if (QFileInfo::exists(rapidPython) && QFileInfo::exists(rapidWorker)) {
+        m_worker.setProgram(rapidPython);
+        m_worker.setArguments({rapidWorker});
+        m_workerIsRapid = true;
+    } else {
+        m_worker.setProgram(applicationDir + QStringLiteral("/glance-ocr-worker"));
+    }
+    m_worker.setStandardErrorFile(QProcess::nullDevice());
+    connectWorker();
+    m_workerAvailable = QFileInfo::exists(m_worker.program())
+        && (!m_workerIsRapid || QFileInfo::exists(rapidWorker));
+}
+
+void OcrManager::connectWorker()
+{
+    connect(&m_worker, &QProcess::readyReadStandardOutput,
+            this, &OcrManager::handleWorkerOutput);
+    connect(&m_worker, &QProcess::finished, this, [this] {
+        m_workerAvailable = false;
+        if (!m_workerRequestActive)
+            return;
+        m_workerRequestActive = false;
+        m_workerFailed = true;
+        startTesseract();
+    });
+}
+
+OcrManager::~OcrManager()
+{
+    m_worker.disconnect();
+    m_worker.terminate();
+    if (!m_worker.waitForFinished(500)) {
+        m_worker.kill();
+        m_worker.waitForFinished(500);
+    }
+}
+
+void OcrManager::prewarm()
+{
+    if (m_workerAvailable && m_worker.state() == QProcess::NotRunning)
+        m_worker.start();
 }
 
 void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
                            int generation)
 {
     cancel();
+    prewarm();
     begin(path, page, pageSize, generation);
     m_isRegion = false;
+    m_workerFailed = false;
     m_fallbackPass = false;
     m_region = QRectF();
-    m_cacheKey = QStringLiteral("v6|tesseract-5|%1|%2|%3|%4|%5|eng|200")
+    const QString backend = m_workerAvailable && m_workerIsRapid
+        ? QStringLiteral("rapidocr-3.9.2") : QStringLiteral("tesseract-5");
+    m_cacheKey = QStringLiteral("v7|%1|%2|%3|%4|%5|%6|eng|200")
+        .arg(backend)
         .arg(QFileInfo(path).canonicalFilePath())
         .arg(QFileInfo(path).size())
         .arg(QFileInfo(path).lastModified().toMSecsSinceEpoch())
@@ -51,7 +108,8 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
              + QLatin1Char('x') + QString::number(pageSize.height(), 'f', 2));
     Result result;
     const auto cached = m_cache.constFind(m_cacheKey);
-    if (cached != m_cache.cend() || loadCached(m_cacheKey, result)) {
+    if (m_cacheEnabled
+            && (cached != m_cache.cend() || loadCached(m_cacheKey, result))) {
         if (cached != m_cache.cend())
             result = cached.value();
         else
@@ -70,7 +128,7 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
 
     if (!m_isPdf) {
         setProgress(45);
-        startTesseract();
+        startRecognition();
         return;
     }
     m_stage = Stage::Rendering;
@@ -111,10 +169,40 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
     cancel();
     begin(path, page, pageSize, generation);
     m_isRegion = true;
+    m_workerFailed = false;
     m_fallbackPass = false;
     m_region = region.intersected(QRectF(QPointF(0, 0), pageSize));
     if (m_region.isEmpty()) {
         emit regionFinished(generation, page, m_region, {}, QStringLiteral("Empty OCR region"));
+        return;
+    }
+    const QFileInfo info(path);
+    const QString backend = m_workerAvailable && m_workerIsRapid
+        ? QStringLiteral("rapidocr-3.9.2") : QStringLiteral("tesseract-5");
+    m_cacheKey = QStringLiteral("region-v4|%1|%2|%3|%4|%5|%6,%7,%8,%9|eng|6x")
+        .arg(backend)
+        .arg(info.canonicalFilePath())
+        .arg(info.size())
+        .arg(info.lastModified().toMSecsSinceEpoch())
+        .arg(page)
+        .arg(QString::number(m_region.x(), 'f', 1))
+        .arg(QString::number(m_region.y(), 'f', 1))
+        .arg(QString::number(m_region.width(), 'f', 1))
+        .arg(QString::number(m_region.height(), 'f', 1));
+    Result cached;
+    const auto memory = m_cache.constFind(m_cacheKey);
+    if (m_cacheEnabled
+            && (memory != m_cache.cend() || loadCached(m_cacheKey, cached))) {
+        if (memory != m_cache.cend())
+            cached = memory.value();
+        else
+            m_cache.insert(m_cacheKey, cached);
+        const QRectF cachedRegion = m_region;
+        QMetaObject::invokeMethod(this,
+            [this, cached, generation, page, cachedRegion] {
+                emit regionFinished(generation, page, cachedRegion,
+                                    cached.words, QString());
+            }, Qt::QueuedConnection);
         return;
     }
     m_scaleX = 72.0 / 400.0;
@@ -173,7 +261,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
         m_scaleY = m_region.height() / crop.height();
         setRunning(true);
         setProgress(45);
-        startTesseract();
+        startRecognition();
         return;
     }
     setRunning(true);
@@ -181,7 +269,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
     m_stage = Stage::Rendering;
     const qreal pixelsPerPoint = 400.0 / 72.0;
     m_process.setProgram(QStringLiteral("nice"));
-    m_process.setArguments({QStringLiteral("-n"), QStringLiteral("10"),
+    m_process.setArguments({QStringLiteral("-n"), QStringLiteral("0"),
                             QStringLiteral("pdftoppm"), QStringLiteral("-f"),
                             QString::number(page + 1), QStringLiteral("-l"),
                             QString::number(page + 1), QStringLiteral("-r"),
@@ -206,8 +294,18 @@ void OcrManager::cancel()
         m_process.kill();
         m_process.waitForFinished(1000);
     }
+    if (m_workerRequestActive && m_worker.state() != QProcess::NotRunning) {
+        m_workerRequestActive = false;
+        m_worker.disconnect();
+        m_worker.kill();
+        m_worker.waitForFinished(1000);
+        connectWorker();
+        m_workerBuffer.clear();
+        m_workerAvailable = QFileInfo::exists(m_worker.program());
+    }
     setRunning(false);
     setProgress(0);
+    m_workerRequestActive = false;
 }
 
 void OcrManager::setRunning(bool running)
@@ -226,6 +324,13 @@ void OcrManager::setProgress(int progress)
     emit progressChanged();
 }
 
+void OcrManager::startRecognition()
+{
+    if (!m_workerFailed && !m_workerRequestActive && startWorkerRequest())
+        return;
+    startTesseract();
+}
+
 void OcrManager::startTesseract()
 {
     m_stage = Stage::Recognizing;
@@ -233,7 +338,8 @@ void OcrManager::startTesseract()
         ? m_tempDir.filePath(QStringLiteral("page.png")) : m_path;
     const QString output = m_tempDir.filePath(QStringLiteral("ocr"));
     m_process.setProgram(QStringLiteral("nice"));
-    m_process.setArguments({QStringLiteral("-n"), QStringLiteral("10"),
+    m_process.setArguments({QStringLiteral("-n"),
+                            m_isRegion ? QStringLiteral("0") : QStringLiteral("10"),
                             QStringLiteral("tesseract"), input, output,
                             QStringLiteral("-l"), QStringLiteral("eng"),
                             QStringLiteral("--psm"),
@@ -242,6 +348,94 @@ void OcrManager::startTesseract()
                                                          : QStringLiteral("3")),
                             QStringLiteral("tsv"), QStringLiteral("makebox")});
     m_process.start();
+}
+
+bool OcrManager::startWorkerRequest()
+{
+    if (!m_workerAvailable)
+        return false;
+    if (m_worker.state() == QProcess::NotRunning) {
+        m_worker.start();
+        if (!m_worker.waitForStarted(100))
+            return false;
+    }
+    const QJsonObject request{{QStringLiteral("id"), m_generation},
+                              {QStringLiteral("path"),
+                               (m_isPdf || m_isRegion)
+                                   ? m_tempDir.filePath(QStringLiteral("page.png"))
+                                   : m_path}};
+    m_workerRequestActive = true;
+    m_stage = Stage::Recognizing;
+    m_worker.write(QJsonDocument(request).toJson(QJsonDocument::Compact));
+    m_worker.write("\n");
+    return true;
+}
+
+void OcrManager::handleWorkerOutput()
+{
+    m_workerBuffer += m_worker.readAllStandardOutput();
+    while (true) {
+        const qsizetype newline = m_workerBuffer.indexOf('\n');
+        if (newline < 0)
+            return;
+        const QByteArray line = m_workerBuffer.left(newline);
+        m_workerBuffer.remove(0, newline + 1);
+        const QJsonDocument document = QJsonDocument::fromJson(line);
+        if (!document.isObject() || !m_workerRequestActive)
+            continue;
+        const QJsonObject object = document.object();
+        if (object.value(QStringLiteral("id")).toInt() != m_generation)
+            continue;
+        m_workerRequestActive = false;
+        const QString error = object.value(QStringLiteral("error")).toString();
+        if (!error.isEmpty()) {
+            m_workerFailed = true;
+            startTesseract();
+            return;
+        }
+        QVariantList words = object.value(QStringLiteral("words")).toArray().toVariantList();
+        if (words.isEmpty()) {
+            m_workerFailed = true;
+            startTesseract();
+            return;
+        }
+        for (QVariant &value : words) {
+            QVariantMap word = value.toMap();
+            const qreal offsetX = m_isRegion ? m_region.x() : 0;
+            const qreal offsetY = m_isRegion ? m_region.y() : 0;
+            word[QStringLiteral("x")] = word.value(QStringLiteral("x")).toDouble() * m_scaleX + offsetX;
+            word[QStringLiteral("y")] = word.value(QStringLiteral("y")).toDouble() * m_scaleY + offsetY;
+            word[QStringLiteral("w")] = word.value(QStringLiteral("w")).toDouble() * m_scaleX;
+            word[QStringLiteral("h")] = word.value(QStringLiteral("h")).toDouble() * m_scaleY;
+            QVariantList chars = word.value(QStringLiteral("chars")).toList();
+            for (QVariant &charValue : chars) {
+                QVariantMap character = charValue.toMap();
+                character[QStringLiteral("x")] = character.value(QStringLiteral("x")).toDouble() * m_scaleX + offsetX;
+                character[QStringLiteral("y")] = character.value(QStringLiteral("y")).toDouble() * m_scaleY + offsetY;
+                character[QStringLiteral("w")] = character.value(QStringLiteral("w")).toDouble() * m_scaleX;
+                character[QStringLiteral("h")] = character.value(QStringLiteral("h")).toDouble() * m_scaleY;
+                charValue = character;
+            }
+            word[QStringLiteral("chars")] = chars;
+            value = word;
+        }
+        setProgress(100);
+        setRunning(false);
+        m_stage = Stage::Idle;
+        QStringList text;
+        for (const QVariant &value : words)
+            text.append(value.toMap().value(QStringLiteral("text")).toString());
+        const Result result{text.join(QLatin1Char('\n')), words};
+        if (m_cacheEnabled) {
+            m_cache.insert(m_cacheKey, result);
+            saveCached(m_cacheKey, result);
+        }
+        if (m_isRegion)
+            emit regionFinished(m_generation, m_page, m_region, words, QString());
+        else
+            emit finished(m_generation, m_page, result.text, words, QString());
+        return;
+    }
 }
 
 void OcrManager::finishWithError(const QString &error)
@@ -271,8 +465,6 @@ void OcrManager::parseTsv()
     while (!stream.atEnd()) {
         const QStringList fields = stream.readLine().split(QLatin1Char('\t'));
         if (fields.size() < 12 || fields.at(0) != QStringLiteral("5"))
-            continue;
-        if (m_isRegion && fields.at(10).toDouble() < 30.0)
             continue;
         const QString word = fields.mid(11).join(QStringLiteral("\t")).trimmed();
         if (word.isEmpty())
@@ -358,12 +550,19 @@ void OcrManager::parseTsv()
     setRunning(false);
     m_stage = Stage::Idle;
     if (m_isRegion) {
+        const Result result{text.join(QLatin1Char(' ')), words};
+        if (m_cacheEnabled && (!m_workerIsRapid || !m_workerFailed)) {
+            m_cache.insert(m_cacheKey, result);
+            saveCached(m_cacheKey, result);
+        }
         emit regionFinished(m_generation, m_page, m_region, words, QString());
         return;
     }
     const Result result{text.join(QLatin1Char(' ')), words};
-    m_cache.insert(m_cacheKey, result);
-    saveCached(m_cacheKey, result);
+    if (m_cacheEnabled && (!m_workerIsRapid || !m_workerFailed)) {
+        m_cache.insert(m_cacheKey, result);
+        saveCached(m_cacheKey, result);
+    }
     emit finished(m_generation, m_page, result.text, result.words, QString());
 }
 
@@ -401,7 +600,10 @@ void OcrManager::saveCached(const QString &key, const Result &result) const
                              {QStringLiteral("words"), QJsonArray::fromVariantList(result.words)}};
     file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
     file.commit();
-    pruneCache();
+    if (!m_cachePruned) {
+        pruneCache();
+        m_cachePruned = true;
+    }
 }
 
 void OcrManager::pruneCache() const
