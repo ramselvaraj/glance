@@ -385,21 +385,26 @@ bool Document::pageHasText(int pageNumber) const
         return false;
     QMutexLocker lock(&m_mutex);
     fz_stext_page *page = nullptr;
+    bool found = false;
+    // Never `return` from inside fz_try: it leaks an exception-stack frame, and
+    // after enough of them every MuPDF call fails ("exception stack overflow").
     fz_try(m_ctx) {
         page = textPage(pageNumber);
-        for (fz_stext_block *block = page->first_block; block; block = block->next) {
+        for (fz_stext_block *block = page->first_block; block && !found; block = block->next) {
             if (block->type != FZ_STEXT_BLOCK_TEXT)
                 continue;
             for (fz_stext_line *line = block->u.t.first_line; line; line = line->next) {
-                if (line->first_char)
-                    return true;
+                if (line->first_char) {
+                    found = true;
+                    break;
+                }
             }
         }
     }
     fz_catch(m_ctx) {
         return false;
     }
-    return false;
+    return found;
 }
 
 namespace {
@@ -921,6 +926,7 @@ QVariantMap Document::selectTextAt(int pageNumber, QPointF point,
 
     QMutexLocker lock(&m_mutex);
     char *text = nullptr;
+    bool handled = false;   // never `return` inside fz_try: it leaks a stack frame
     fz_try(m_ctx) {
         const QPointF origin = m_origins.at(pageNumber);
         const QSizeF size = m_sizes.at(pageNumber);
@@ -935,9 +941,10 @@ QVariantMap Document::selectTextAt(int pageNumber, QPointF point,
             if (selectWordRun(structuredText, a, bounds, runText, runBoxes)) {
                 result.insert(QStringLiteral("text"), runText);
                 result.insert(QStringLiteral("boxes"), runBoxes);
-                return result;
+                handled = true;
             }
         }
+        if (!handled) {
         const int snapMode = mode == QStringLiteral("line")
             ? FZ_SELECT_LINES : FZ_SELECT_WORDS;
         fz_snap_selection(m_ctx, structuredText, &a, &b, snapMode);
@@ -951,6 +958,7 @@ QVariantMap Document::selectTextAt(int pageNumber, QPointF point,
         text = fz_copy_selection(m_ctx, structuredText, a, b, 0);
         result.insert(QStringLiteral("text"), QString::fromUtf8(text ? text : ""));
         result.insert(QStringLiteral("boxes"), boxes);
+        }
     }
     fz_always(m_ctx) {
         fz_free(m_ctx, text);
@@ -1014,6 +1022,7 @@ bool Document::pageTextEndpoints(int pageNumber, QPointF &first, QPointF &last) 
     fz_stext_page *page = nullptr;
     fz_stext_char *firstChar = nullptr;
     fz_stext_char *lastChar = nullptr;
+    bool ok = false;
     fz_try(m_ctx) {
         page = textPage(pageNumber);
         for (fz_stext_block *block = page->first_block; block; block = block->next) {
@@ -1027,20 +1036,21 @@ bool Document::pageTextEndpoints(int pageNumber, QPointF &first, QPointF &last) 
                 lastChar = line->last_char;
             }
         }
-        if (!firstChar || !lastChar)
-            return false;
-        const QPointF origin = m_origins.at(pageNumber);
-        const auto center = [&origin](const fz_quad &q) {
-            return QPointF((q.ul.x + q.ur.x + q.ll.x + q.lr.x) / 4 - origin.x(),
-                           (q.ul.y + q.ur.y + q.ll.y + q.lr.y) / 4 - origin.y());
-        };
-        first = center(firstChar->quad);
-        last = center(lastChar->quad);
+        if (firstChar && lastChar) {
+            const QPointF origin = m_origins.at(pageNumber);
+            const auto center = [&origin](const fz_quad &q) {
+                return QPointF((q.ul.x + q.ur.x + q.ll.x + q.lr.x) / 4 - origin.x(),
+                               (q.ul.y + q.ur.y + q.ll.y + q.lr.y) / 4 - origin.y());
+            };
+            first = center(firstChar->quad);
+            last = center(lastChar->quad);
+            ok = true;
+        }
     }
     fz_catch(m_ctx) {
         return false;
     }
-    return true;
+    return ok;
 }
 
 fz_stext_page *Document::textPage(int pageNumber) const

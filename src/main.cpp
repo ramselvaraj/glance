@@ -170,8 +170,14 @@ int main(int argc, char *argv[])
         const QStringList f = parser.value(wordSelfOpt).split(QLatin1Char(','));
         if (f.size() != 3 || !doc->isOpen())
             return 1;
-        const QVariantMap r = doc->selectTextAt(f[0].toInt() - 1,
-            QPointF(f[1].toDouble(), f[2].toDouble()), QStringLiteral("word"));
+        // Repeated well past MuPDF's exception-stack depth (256): a leaked
+        // fz_try frame per call would make the later calls fail.
+        QVariantMap r;
+        for (int i = 0; i < 600; ++i) {
+            r = doc->selectTextAt(f[0].toInt() - 1,
+                QPointF(f[1].toDouble(), f[2].toDouble()), QStringLiteral("word"));
+            doc->pageHasText(f[0].toInt() - 1);
+        }
         fprintf(stderr, "word-selftest: [%s] boxes=%d\n",
                 r.value("text").toString().toUtf8().constData(),
                 int(r.value("boxes").toList().size()));
