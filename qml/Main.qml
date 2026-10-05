@@ -125,6 +125,35 @@ Window {
             currentPage = i + 1
     }
 
+    // Jump list so a followed link (or a :goto) can be undone with Ctrl+o.
+    property var navBack: []
+
+    function pushNav() {
+        if (pageCount === 0)
+            return
+        navBack = navBack.concat([viewPosition()]).slice(-50)
+    }
+
+    function goBack() {
+        if (navBack.length === 0)
+            return
+        const pos = navBack[navBack.length - 1]
+        navBack = navBack.slice(0, -1)
+        const y = pageTopAt(pos.page, zoom) + pos.offset * sheetHpt(pos.page) * zoom
+        view.contentY = Math.max(0, Math.min(y, Math.max(0, view.contentHeight - view.height)))
+    }
+
+    function followLink(link) {
+        if (link.external) {
+            Doc.openExternal(link.uri)
+            return
+        }
+        pushNav()
+        const lead = rotation === 0 ? Math.max(0, link.destY - 28) : 0
+        const y = pageTopAt(link.page, zoom) + lead * zoom
+        view.contentY = Math.max(0, Math.min(y, Math.max(0, view.contentHeight - view.height)))
+    }
+
     function jumpTo(page, animate) {
         if (page < 1 || page > pageCount)
             return
@@ -364,6 +393,7 @@ Window {
         }
         if (target < 0 || target >= pageCount)
             return false
+        pushNav()
         jumpTo(target + 1, false)
         return true
     }
@@ -996,6 +1026,7 @@ Window {
                     : url.toString()
         saveViewState()
         if (Doc.open(path)) {
+            navBack = []
             viewStateReady = false
             initialFitDone = false
             pendingViewState = Doc.loadViewState()
@@ -1751,6 +1782,8 @@ Window {
     Shortcut { sequence: "?"; enabled: !root.typing; onActivated: root.openSearch(true) }
     Shortcut { sequence: ":"; enabled: !root.typing; onActivated: root.openCommand() }
     Shortcut { sequence: "Ctrl+g"; onActivated: root.openCommand() }
+    Shortcut { sequence: "Ctrl+o"; enabled: !root.typing; onActivated: root.goBack() }
+    Shortcut { sequence: "Alt+Left"; enabled: !root.typing; onActivated: root.goBack() }
     Shortcut { sequence: "n"; enabled: root.searchActive && !root.typing;
                onActivated: root.runSearch(false, root.searchBackward ? -1 : 1) }
     Shortcut { sequence: "Shift+n"; enabled: root.searchActive && !root.typing;
@@ -1783,20 +1816,24 @@ Window {
     Shortcut { sequence: "g"; enabled: !root.typing; onActivated: {
         if (root.gPending) {
             root.gPending = false
-            if (root.vimCount > 0)
+            if (root.vimCount > 0) {
                 root.gotoPage(String(root.takeCount()))
-            else
+            } else {
+                root.pushNav()
                 root.jumpTo(1, false)
+            }
         } else {
             root.gPending = true
             gPendingTimer.restart()
         }
     } }
     Shortcut { sequence: "G"; enabled: !root.typing; onActivated: {
-        if (root.vimCount > 0)
+        if (root.vimCount > 0) {
             root.gotoPage(String(root.takeCount()))
-        else
+        } else {
+            root.pushNav()
             root.jumpTo(root.pageCount, false)
+        }
     } }
     Timer { id: gPendingTimer; interval: 800; onTriggered: root.gPending = false }
     Item {

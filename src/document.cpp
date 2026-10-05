@@ -4,7 +4,9 @@
 #include <QThreadPool>
 #include <QCryptographicHash>
 #include <QDateTime>
+#include <QDesktopServices>
 #include <QGuiApplication>
+#include <QUrl>
 #include <QSettings>
 #include <QClipboard>
 #include <QDebug>
@@ -225,6 +227,10 @@ void Document::reset()
     cancelSearch();
     m_textPool.waitForDone();
     m_renderPool.waitForDone();
+    {
+        QMutexLocker lock(&m_linkMutex);
+        m_linkCache.clear();
+    }
     for (fz_stext_page *page : std::as_const(m_textPages))
         fz_drop_stext_page(m_ctx, page);
     m_textPages.clear();
@@ -401,6 +407,91 @@ void Document::saveViewState(const QVariantMap &state) const
         for (int i = 0; i < groups.size() - kMaxRememberedFiles; ++i)
             settings.remove(byAge.at(i).second);
     }
+}
+
+QVariantList Document::loadLinks(int pageNumber) const
+{
+    QVariantList result;
+    QMutexLocker lock(&m_mutex);
+    if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
+        return result;
+    fz_page *page = nullptr;
+    fz_link *links = nullptr;
+    fz_try(m_ctx) {
+        const QPointF origin = m_origins.at(pageNumber);
+        page = fz_load_page(m_ctx, m_doc, pageNumber);
+        links = fz_load_links(m_ctx, page);
+        for (fz_link *link = links; link; link = link->next) {
+            if (!link->uri)
+                continue;
+            QVariantMap entry{
+                {QStringLiteral("x"), link->rect.x0 - origin.x()},
+                {QStringLiteral("y"), link->rect.y0 - origin.y()},
+                {QStringLiteral("w"), link->rect.x1 - link->rect.x0},
+                {QStringLiteral("h"), link->rect.y1 - link->rect.y0},
+                {QStringLiteral("uri"), QString::fromUtf8(link->uri)},
+                {QStringLiteral("external"), bool(fz_is_external_link(m_ctx, link->uri))},
+                {QStringLiteral("page"), -1},
+                {QStringLiteral("destY"), 0.0}};
+            if (!entry.value(QStringLiteral("external")).toBool()) {
+                fz_link_dest dest = fz_resolve_link_dest(m_ctx, m_doc, link->uri);
+                const int target = fz_page_number_from_location(m_ctx, m_doc, dest.loc);
+                if (target < 0 || target >= m_pageCount)
+                    continue;
+                entry[QStringLiteral("page")] = target;
+                if (std::isfinite(dest.y))
+                    entry[QStringLiteral("destY")] = dest.y - m_origins.at(target).y();
+            }
+            result.append(entry);
+        }
+    }
+    fz_always(m_ctx) {
+        fz_drop_link(m_ctx, links);
+        fz_drop_page(m_ctx, page);
+    }
+    fz_catch(m_ctx) {
+        qWarning() << "glance: could not load links on page" << pageNumber;
+    }
+    return result;
+}
+
+QVariantList Document::cachedLinks(int page) const
+{
+    QMutexLocker lock(&m_linkMutex);
+    return m_linkCache.value(page);
+}
+
+void Document::requestLinks(int page)
+{
+    {
+        QMutexLocker lock(&m_linkMutex);
+        if (m_linkCache.contains(page))
+            return;
+        m_linkCache.insert(page, {});   // claim it so duplicate requests are dropped
+    }
+    const QString path = m_path;
+    m_textPool.start([this, page, path] {
+        const QVariantList links = loadLinks(page);
+        {
+            QMutexLocker lock(&m_linkMutex);
+            m_linkCache.insert(page, links);
+        }
+        if (!links.isEmpty())
+            QMetaObject::invokeMethod(this, [this, page, links, path] {
+                if (path == m_path)
+                    emit linksReady(page, links);
+            }, Qt::QueuedConnection);
+    });
+}
+
+bool Document::openExternal(const QString &uri) const
+{
+    const QUrl url(uri);
+    const QString scheme = url.scheme().toLower();
+    if (scheme != QLatin1String("http") && scheme != QLatin1String("https")
+            && scheme != QLatin1String("mailto"))
+        return false;
+    return QDesktopServices::openUrl(url);
 }
 
 void Document::ensureLabels() const

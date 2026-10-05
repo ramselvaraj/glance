@@ -49,6 +49,15 @@ public:
     Q_INVOKABLE QVariantMap loadViewState() const;
     Q_INVOKABLE void saveViewState(const QVariantMap &state) const;
 
+    // Links on a page, loaded off the GUI thread: requestLinks() emits
+    // linksReady(page, links); cachedLinks() returns what is loaded so far.
+    // Each link: {x,y,w,h (page points), external, uri, page (0-based, -1 if
+    // external), destY (page points, 0 if unspecified)}.
+    Q_INVOKABLE QVariantList cachedLinks(int page) const;
+    Q_INVOKABLE void requestLinks(int page);
+    // Opens http/https/mailto links with the desktop; anything else is refused.
+    Q_INVOKABLE bool openExternal(const QString &uri) const;
+
     Q_INVOKABLE QString pageLabel(int page) const;
     // 0-based page whose label equals `label` (case-insensitive), or -1.
     Q_INVOKABLE int pageForLabel(const QString &label) const;
@@ -87,6 +96,7 @@ public:
     bool isOpen() const { return m_doc != nullptr; }
 
 signals:
+    void linksReady(int page, const QVariantList &links);
     void pageCountChanged(int count);
     void searchFinished(int generation, const QVariantList &results);
 
@@ -95,6 +105,9 @@ private:
     bool load(const QString &path);
     void computeSizes();
     fz_stext_page *textPage(int page) const;
+    QVariantList loadLinks(int page) const;
+    mutable QHash<int, QVariantList> m_linkCache;
+    mutable QMutex m_linkMutex;
     void ensureLabels() const;
     mutable QStringList m_labels;
     mutable bool m_labelsBuilt = false;

@@ -111,6 +111,26 @@ Item {
             }
         }
 
+        // Clickable links (page point coords -> item coords).
+        Repeater {
+            model: pg.links
+            delegate: Rectangle {
+                x: modelData.x * pg.zoom
+                y: modelData.y * pg.zoom
+                width: modelData.w * pg.zoom
+                height: modelData.h * pg.zoom
+                color: linkHover.hovered ? Theme.accent : "transparent"
+                opacity: linkHover.hovered ? 0.22 : 1
+                HoverHandler {
+                    id: linkHover
+                    cursorShape: Qt.PointingHandCursor
+                }
+                TapHandler {
+                    onTapped: root.followLink(modelData)
+                }
+            }
+        }
+
         // Search hit highlights (page point coords -> item coords).
         Repeater {
             model: (root.searchPage === pg.page) ? root.searchBoxes : []
@@ -163,9 +183,20 @@ Item {
         }
     }
 
+    property var links: []
+    Connections {
+        target: Doc
+        function onLinksReady(page, list) {
+            if (page === pg.page)
+                pg.links = list
+        }
+    }
+
     property color darkerEdge: "#00000000"
     Component.onCompleted: {
         darkerEdge = Theme.darkerBackground
+        links = Doc.cachedLinks(page)
+        Doc.requestLinks(page)
         renderedExp = bucketExp
         ready = true
         maybeUpgrade()

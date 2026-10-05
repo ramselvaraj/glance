@@ -16,6 +16,7 @@
 #include "ocrmanager.h"
 #include "inputstate.h"
 #include "theme.h"
+#include <QThread>
 
 static void stderrMessageHandler(QtMsgType, const QMessageLogContext &,
                                  const QString &msg)
@@ -197,6 +198,25 @@ int main(int argc, char *argv[])
         fprintf(stderr, "selftest: labels page1='%s' page2='%s' page42='%s' find('40')=%d\n",
                 doc->pageLabel(0).toUtf8().constData(), doc->pageLabel(1).toUtf8().constData(),
                 doc->pageLabel(41).toUtf8().constData(), doc->pageForLabel(QStringLiteral("40")));
+        for (int probe : {2, 3, 40}) {
+            if (probe >= doc->pageCount())
+                continue;
+            doc->requestLinks(probe);
+        }
+        QThread::msleep(800);
+        for (int probe : {2, 3, 40}) {
+            if (probe >= doc->pageCount())
+                continue;
+            const QVariantList links = doc->cachedLinks(probe);
+            fprintf(stderr, "selftest: page %d links=%d\n", probe + 1, int(links.size()));
+            for (int i = 0; i < std::min<int>(links.size(), 3); ++i) {
+                const QVariantMap l = links.at(i).toMap();
+                fprintf(stderr, "  link rect=(%.0f,%.0f %.0fx%.0f) ext=%d page=%d destY=%.0f uri=%s\n",
+                        l["x"].toDouble(), l["y"].toDouble(), l["w"].toDouble(), l["h"].toDouble(),
+                        int(l["external"].toBool()), l["page"].toInt(), l["destY"].toDouble(),
+                        l["uri"].toString().left(50).toUtf8().constData());
+            }
+        }
         fprintf(stderr, "selftest: page0 text=%s images=%s\n",
                 doc->pageHasText(0) ? "yes" : "no",
                 doc->pageHasImages(0) ? "yes" : "no");
