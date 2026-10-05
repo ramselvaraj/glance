@@ -125,7 +125,7 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
     setProgress(5);
     setRunning(true);
 
-    QFile::remove(m_tempDir.filePath(QStringLiteral("page.png")));
+    QFile::remove(m_tempDir.filePath(QStringLiteral("page.ppm")));
     QFile::remove(m_tempDir.filePath(QStringLiteral("ocr.tsv")));
     QFile::remove(m_tempDir.filePath(QStringLiteral("ocr.box")));
 
@@ -141,8 +141,7 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
                             QStringLiteral("pdftoppm"), QStringLiteral("-f"),
                             QString::number(page + 1), QStringLiteral("-l"),
                             QString::number(page + 1), QStringLiteral("-r"),
-                            QStringLiteral("200"), QStringLiteral("-png"),
-                            QStringLiteral("-singlefile"), path, prefix});
+                            QStringLiteral("200"), QStringLiteral("-singlefile"), path, prefix});
     m_process.start();
 }
 
@@ -210,7 +209,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
     }
     m_scaleX = 72.0 / 400.0;
     m_scaleY = 72.0 / 400.0;
-    QFile::remove(m_tempDir.filePath(QStringLiteral("page.png")));
+    QFile::remove(m_tempDir.filePath(QStringLiteral("page.ppm")));
     QFile::remove(m_tempDir.filePath(QStringLiteral("ocr.tsv")));
     QFile::remove(m_tempDir.filePath(QStringLiteral("ocr.box")));
     if (!m_isPdf) {
@@ -256,7 +255,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
                 }
             }
         }
-        if (crop.isNull() || !crop.save(m_tempDir.filePath(QStringLiteral("page.png")))) {
+        if (crop.isNull() || !crop.save(m_tempDir.filePath(QStringLiteral("page.ppm")))) {
             finishWithError(QStringLiteral("Could not prepare OCR region"));
             return;
         }
@@ -284,7 +283,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
                             QString::number(qRound(m_region.width() * pixelsPerPoint)),
                             QStringLiteral("-H"),
                             QString::number(qRound(m_region.height() * pixelsPerPoint)),
-                            QStringLiteral("-png"), QStringLiteral("-singlefile"),
+                            QStringLiteral("-singlefile"),
                             path, m_tempDir.filePath(QStringLiteral("page"))});
     m_process.start();
 }
@@ -342,12 +341,18 @@ void OcrManager::startTesseract()
 {
     m_stage = Stage::Recognizing;
     const QString input = (m_isPdf || m_isRegion)
-        ? m_tempDir.filePath(QStringLiteral("page.png")) : m_path;
+        ? m_tempDir.filePath(QStringLiteral("page.ppm")) : m_path;
     const QString output = m_tempDir.filePath(QStringLiteral("ocr"));
+    // PPM carries no DPI metadata, so state the render resolution explicitly.
+    QStringList dpi;
+    if (m_isPdf)
+        dpi = {QStringLiteral("--dpi"),
+               m_isRegion ? QStringLiteral("400") : QStringLiteral("200")};
     m_process.setProgram(QStringLiteral("nice"));
-    m_process.setArguments({QStringLiteral("-n"),
+    m_process.setArguments(QStringList{QStringLiteral("-n"),
                             m_isRegion ? QStringLiteral("0") : QStringLiteral("10"),
-                            QStringLiteral("tesseract"), input, output,
+                            QStringLiteral("tesseract"), input, output}
+                           + dpi + QStringList{
                             QStringLiteral("-l"), QStringLiteral("eng"),
                             QStringLiteral("--psm"),
                             m_isRegion ? QStringLiteral("11")
@@ -369,7 +374,7 @@ bool OcrManager::startWorkerRequest()
     const QJsonObject request{{QStringLiteral("id"), m_generation},
                               {QStringLiteral("path"),
                                (m_isPdf || m_isRegion)
-                                   ? m_tempDir.filePath(QStringLiteral("page.png"))
+                                   ? m_tempDir.filePath(QStringLiteral("page.ppm"))
                                    : m_path}};
     m_workerRequestActive = true;
     m_stage = Stage::Recognizing;
@@ -522,7 +527,7 @@ void OcrManager::parseTsv()
             const qreal right = fields.at(3).toDouble();
             const qreal top = fields.at(4).toDouble();
             const QImageReader reader((m_isPdf || m_isRegion)
-                ? m_tempDir.filePath(QStringLiteral("page.png")) : m_path);
+                ? m_tempDir.filePath(QStringLiteral("page.ppm")) : m_path);
             const qreal imageHeight = reader.size().height();
             const qreal x = left * m_scaleX + (m_isRegion ? m_region.x() : 0);
             const qreal y = (imageHeight - top) * m_scaleY

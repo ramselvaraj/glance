@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import re
 import sys
 
@@ -71,7 +72,13 @@ def recognize(engine, request):
 
 
 def main():
-    engine = RapidOCR()
+    threads = min(8, os.cpu_count() or 1)
+    engine = RapidOCR(
+        params={
+            "EngineConfig.onnxruntime.intra_op_num_threads": threads,
+            "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+        }
+    )
     for line in sys.stdin:
         try:
             request = json.loads(line)
