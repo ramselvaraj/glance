@@ -2,7 +2,10 @@
 
 #include <QFileInfo>
 #include <QThreadPool>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QGuiApplication>
+#include <QSettings>
 #include <QClipboard>
 #include <QDebug>
 
@@ -340,6 +343,64 @@ bool Document::pageHasText(int pageNumber) const
         return false;
     }
     return false;
+}
+
+namespace {
+constexpr int kMaxRememberedFiles = 200;
+
+QString viewStateKey(const QString &path)
+{
+    const QString canonical = QFileInfo(path).canonicalFilePath();
+    return QString::fromLatin1(QCryptographicHash::hash(
+        (canonical.isEmpty() ? path : canonical).toUtf8(),
+        QCryptographicHash::Sha1).toHex());
+}
+}
+
+QVariantMap Document::loadViewState() const
+{
+    if (!isOpen())
+        return {};
+    QSettings settings;
+    settings.beginGroup(QStringLiteral("view/") + viewStateKey(m_path));
+    if (!settings.contains(QStringLiteral("page")))
+        return {};
+    // A different page count means the file changed underneath us.
+    if (settings.value(QStringLiteral("pageCount")).toInt() != m_pageCount)
+        return {};
+    QVariantMap state;
+    state.insert(QStringLiteral("page"), settings.value(QStringLiteral("page")).toInt());
+    state.insert(QStringLiteral("offset"), settings.value(QStringLiteral("offset")).toDouble());
+    state.insert(QStringLiteral("zoom"), settings.value(QStringLiteral("zoom")).toDouble());
+    state.insert(QStringLiteral("fit"), settings.value(QStringLiteral("fit")).toBool());
+    state.insert(QStringLiteral("rotation"), settings.value(QStringLiteral("rotation")).toInt());
+    return state;
+}
+
+void Document::saveViewState(const QVariantMap &state) const
+{
+    if (!isOpen() || m_pageCount <= 0)
+        return;
+    QSettings settings;
+    const QString key = viewStateKey(m_path);
+    settings.beginGroup(QStringLiteral("view/") + key);
+    for (auto it = state.cbegin(); it != state.cend(); ++it)
+        settings.setValue(it.key(), it.value());
+    settings.setValue(QStringLiteral("pageCount"), m_pageCount);
+    settings.setValue(QStringLiteral("touched"), QDateTime::currentMSecsSinceEpoch());
+    settings.endGroup();
+
+    // Keep the most recently used files only.
+    settings.beginGroup(QStringLiteral("view"));
+    const QStringList groups = settings.childGroups();
+    if (groups.size() > kMaxRememberedFiles) {
+        QList<QPair<qint64, QString>> byAge;
+        for (const QString &g : groups)
+            byAge.append({settings.value(g + QStringLiteral("/touched")).toLongLong(), g});
+        std::sort(byAge.begin(), byAge.end());
+        for (int i = 0; i < groups.size() - kMaxRememberedFiles; ++i)
+            settings.remove(byAge.at(i).second);
+    }
 }
 
 void Document::ensureLabels() const

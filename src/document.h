@@ -44,6 +44,11 @@ public:
 
     // Printed page label ("iv", "40") as defined by the PDF; the plain 1-based
     // number when the document defines none. Thread-safe.
+    // Per-file view state (page, offset within it, zoom, fit, rotation) kept in
+    // QSettings so reopening a file lands where you left off. Empty map = none.
+    Q_INVOKABLE QVariantMap loadViewState() const;
+    Q_INVOKABLE void saveViewState(const QVariantMap &state) const;
+
     Q_INVOKABLE QString pageLabel(int page) const;
     // 0-based page whose label equals `label` (case-insensitive), or -1.
     Q_INVOKABLE int pageForLabel(const QString &label) const;

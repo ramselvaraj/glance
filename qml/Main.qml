@@ -231,11 +231,56 @@ Window {
     }
 
     property bool initialFitDone: false
+    // View state remembered per file: restored once after the first fit, and
+    // saving stays off until then so we never overwrite it with page 1.
+    property var pendingViewState: Doc.loadViewState()
+    property bool viewStateReady: false
     property bool autoFitSinglePage: false
+    function fitWidthZoom() {
+        return Math.min(8.0, Math.max(0.2, (view.width - 24) / root.maxPageW))
+    }
+
+    // Top-of-viewport page index and fraction of that page already scrolled past.
+    function viewPosition() {
+        let lo = 0, hi = pageCount - 1
+        const y = view.contentY
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1
+            if (pageTopAt(mid, zoom) <= y)
+                lo = mid
+            else
+                hi = mid - 1
+        }
+        const h = sheetHpt(lo) * zoom
+        return { page: lo, offset: h > 0 ? Math.max(0, Math.min(1, (y - pageTopAt(lo, zoom)) / h)) : 0 }
+    }
+
+    function saveViewState() {
+        if (!viewStateReady || pageCount === 0)
+            return
+        const pos = viewPosition()
+        Doc.saveViewState({ page: pos.page, offset: pos.offset, zoom: zoom,
+                            fit: Math.abs(zoom - fitWidthZoom()) < 0.005,
+                            rotation: rotation })
+    }
+
+    function beginViewRestore() {
+        const state = pendingViewState
+        pendingViewState = null
+        if (!state || state.page === undefined) {
+            viewStateReady = true
+            return
+        }
+        restoreTimer.state = state
+        restoreTimer.start()
+    }
+
     function fitWidth(preserveAutoFit) {
         if (pageCount === 0 || view.width < 100)
             return
-        zoom = Math.min(8.0, Math.max(0.2, (view.width - 24) / root.maxPageW))
+        zoom = fitWidthZoom()
+        if (!initialFitDone)
+            beginViewRestore()
         initialFitDone = true
         if (!preserveAutoFit)
             autoFitSinglePage = false
@@ -749,7 +794,10 @@ Window {
     }
 
     onPageTextCapabilitiesChanged: refreshViewportSelection()
-    onZoomChanged: refreshViewportSelection()
+    onZoomChanged: {
+        refreshViewportSelection()
+        saveViewTimer.restart()
+    }
 
     function requestRegionalOcr(selection) {
         if (!selection)
@@ -946,7 +994,11 @@ Window {
         const path = url.toString().startsWith("file://")
                     ? decodeURIComponent(url.toString().substring(7))
                     : url.toString()
+        saveViewState()
         if (Doc.open(path)) {
+            viewStateReady = false
+            initialFitDone = false
+            pendingViewState = Doc.loadViewState()
             clearSelection()
             closeSearch()
             pageTextCapabilities = ({})
@@ -1773,6 +1825,58 @@ Window {
     Shortcut { sequence: "r"; enabled: !root.typing; onActivated: root.rotateCW() }
     Shortcut { sequence: "t"; enabled: !root.typing; onActivated: root.showThumbs = !root.showThumbs }
     Shortcut { sequence: "o"; enabled: !root.typing; onActivated: picker.open() }
+
+    // ---------- remembered view ----------
+    Timer {
+        id: restoreTimer
+        property var state: null
+        interval: 40
+        onTriggered: {
+            const st = state
+            state = null
+            if (!st) {
+                root.viewStateReady = true
+                return
+            }
+            if (st.rotation !== undefined)
+                root.rotation = Number(st.rotation)
+            if (st.fit !== true && Number(st.zoom) > 0) {
+                root.autoFitSinglePage = false
+                root.zoom = root.clampZoom(Number(st.zoom))
+            }
+            scrollTimer.page = Math.max(0, Math.min(root.pageCount - 1, Number(st.page)))
+            scrollTimer.offset = Number(st.offset) || 0
+            scrollTimer.start()
+        }
+    }
+    Timer {
+        id: scrollTimer
+        property int page: 0
+        property real offset: 0
+        interval: 40
+        onTriggered: {
+            const y = root.pageTopAt(page, root.zoom) + offset * root.sheetHpt(page) * root.zoom
+            view.contentY = Math.max(0, Math.min(y, Math.max(0, view.contentHeight - view.height)))
+            root.viewStateReady = true
+            root.detectPage()
+        }
+    }
+    Timer {
+        id: saveViewTimer
+        interval: 1500
+        onTriggered: root.saveViewState()
+    }
+    Connections {
+        target: view
+        function onContentYChanged() { saveViewTimer.restart() }
+    }
+    onRotationChanged: saveViewTimer.restart()
+    Component.onDestruction: saveViewState()
+    onClosing: saveViewState()
+    Connections {
+        target: Qt.application
+        function onAboutToQuit() { root.saveViewState() }
+    }
 
     // ---------- lifecycle ----------
 
