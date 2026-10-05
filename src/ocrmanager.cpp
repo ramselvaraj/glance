@@ -66,7 +66,10 @@ void OcrManager::connectWorker()
             return;
         m_workerRequestActive = false;
         m_workerFailed = true;
-        startTesseract();
+        if (m_isPdf)
+            startTesseract();
+        else
+            finishWithError(QStringLiteral("RapidOCR worker stopped"));
     });
 }
 
@@ -96,7 +99,7 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
     m_workerFailed = false;
     m_fallbackPass = false;
     m_region = QRectF();
-    const QString backend = m_workerAvailable && m_workerIsRapid
+    const QString backend = !m_isPdf && m_workerAvailable && m_workerIsRapid
         ? QStringLiteral("rapidocr-3.9.2") : QStringLiteral("tesseract-5");
     m_cacheKey = QStringLiteral("v7|%1|%2|%3|%4|%5|%6|eng|200")
         .arg(backend)
@@ -177,7 +180,7 @@ void OcrManager::recognizeRegion(const QString &path, int page, QSizeF pageSize,
         return;
     }
     const QFileInfo info(path);
-    const QString backend = m_workerAvailable && m_workerIsRapid
+    const QString backend = !m_isPdf && m_workerAvailable && m_workerIsRapid
         ? QStringLiteral("rapidocr-3.9.2") : QStringLiteral("tesseract-5");
     m_cacheKey = QStringLiteral("region-v4|%1|%2|%3|%4|%5|%6,%7,%8,%9|eng|6x")
         .arg(backend)
@@ -326,9 +329,13 @@ void OcrManager::setProgress(int progress)
 
 void OcrManager::startRecognition()
 {
+    if (m_isPdf) {
+        startTesseract();
+        return;
+    }
     if (!m_workerFailed && !m_workerRequestActive && startWorkerRequest())
         return;
-    startTesseract();
+    finishWithError(QStringLiteral("RapidOCR is unavailable"));
 }
 
 void OcrManager::startTesseract()
@@ -390,13 +397,20 @@ void OcrManager::handleWorkerOutput()
         const QString error = object.value(QStringLiteral("error")).toString();
         if (!error.isEmpty()) {
             m_workerFailed = true;
-            startTesseract();
+            if (m_isPdf)
+                startTesseract();
+            else
+                finishWithError(error);
             return;
         }
         QVariantList words = object.value(QStringLiteral("words")).toArray().toVariantList();
         if (words.isEmpty()) {
-            m_workerFailed = true;
-            startTesseract();
+            if (m_isPdf) {
+                m_workerFailed = true;
+                startTesseract();
+            } else {
+                finishWithError(QStringLiteral("OCR produced no text output"));
+            }
             return;
         }
         for (QVariant &value : words) {
