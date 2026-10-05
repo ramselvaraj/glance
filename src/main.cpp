@@ -167,8 +167,14 @@ int main(int argc, char *argv[])
             return 1;
         const QVariantMap r = doc->selectText(f[0].toInt() - 1,
             QPointF(f[1].toDouble(), f[2].toDouble()), QPointF(f[3].toDouble(), f[4].toDouble()));
-        fprintf(stderr, "select-selftest: boxes=%d text=[%s]\n",
-                int(r.value("boxes").toList().size()),
+        double minY = 1e9, maxY = -1e9;
+        for (const QVariant &v : r.value("boxes").toList()) {
+            const QVariantMap b = v.toMap();
+            minY = std::min(minY, b.value("y").toDouble());
+            maxY = std::max(maxY, b.value("y").toDouble() + b.value("h").toDouble());
+        }
+        fprintf(stderr, "select-selftest: boxes=%d y=%.1f..%.1f text=[%s]\n",
+                int(r.value("boxes").toList().size()), minY, maxY,
                 r.value("text").toString().toUtf8().constData());
         return 0;
     }
