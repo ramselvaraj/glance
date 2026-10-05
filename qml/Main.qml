@@ -18,6 +18,7 @@ Window {
     property bool showOutline: false
     property var outlineModel: []
     property bool searchActive: false
+    property bool showKeys: false
     property bool searchBackward: false
     property bool cmdActive: false
     property int vimCount: 0
@@ -1463,22 +1464,6 @@ Window {
                 onActivated: root.runSearch(root.searchResults.length === 0, 1)
             }
 
-            HeaderButton { label: "s"; tip: "search"; activeFlag: root.searchActive;
-                           onActivated: {
-                               root.searchActive = !root.searchActive
-                               if (root.searchActive) searchField.forceActiveFocus()
-                               else root.closeSearch()
-                           } }
-            HeaderButton { label: "T"; tip: "outline"; activeFlag: root.showOutline;
-                           onActivated: root.toggleOutline() }
-            HeaderButton { label: "c"; tip: "copy selection or page"; onActivated: root.copyPage() }
-            HeaderButton {
-                label: "ocr"
-                tip: Ocr.running ? "cancel recognition" : "recognize current page"
-                onActivated: {
-                    root.recognizeCurrentPage()
-                }
-            }
             Text {
                 visible: Ocr.running || root.ocrStatus !== ""
                 text: Ocr.running ? (Ocr.progress + "%") : root.ocrStatus
@@ -1488,16 +1473,31 @@ Window {
                 Layout.maximumWidth: 130
                 renderType: Text.QtRendering
             }
-            HeaderButton { label: "w"; tip: "fit width"; onActivated: root.fitWidth() }
-            HeaderButton { label: "p"; tip: "fit page"; onActivated: root.fitPage() }
-            HeaderButton { label: "1"; tip: "100%"; onActivated: root.zoom = 1.0 }
-            HeaderButton { label: "2"; tip: "two-page view"; activeFlag: root.pagesPerRow === 2
-                           onActivated: root.cycleLayout() }
-            HeaderButton { label: "r"; tip: "rotate"; onActivated: root.rotateCW() }
-            HeaderButton { label: "t"; tip: "thumbnails"; activeFlag: root.showThumbs;
-                           onActivated: root.showThumbs = !root.showThumbs }
-            HeaderButton { label: "f"; tip: "fullscreen"; onActivated: root.toggleFullscreen() }
-            HeaderButton { label: "o"; tip: "open file"; onActivated: picker.open() }
+            Rectangle {
+                id: keysButton
+                Layout.preferredWidth: keysLabel.implicitWidth + 24
+                Layout.preferredHeight: 26
+                radius: 6
+                color: keysMouse.containsMouse || root.showKeys ? Theme.selection : "transparent"
+                border.color: root.showKeys ? Theme.accent : Theme.mutedForeground
+                border.width: 1
+                Text {
+                    id: keysLabel
+                    anchors.centerIn: parent
+                    text: "Keybindings"
+                    color: keysMouse.containsMouse || root.showKeys
+                           ? Theme.accent : Theme.foreground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                MouseArea {
+                    id: keysMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.showKeys = !root.showKeys
+                }
+            }
         }
     }
 
@@ -1964,12 +1964,208 @@ Window {
         onAccepted: root.openFromUrl(currentFile)
     }
 
+
+    // ---------- keybindings panel ----------
+    // Each row: keys to show, a plain-language explanation, and (optionally) the
+    // action to run when the row is clicked.
+    readonly property var keySections: [
+        { title: "Move around", items: [
+            { keys: ["j", "k"], desc: "Scroll down / up. Put a number first to repeat: 5j scrolls five steps." },
+            { keys: ["h", "l"], desc: "Scroll left / right when zoomed in." },
+            { keys: ["J", "K"], desc: "Next / previous page (a whole spread in two-page view). 3J jumps three." },
+            { keys: ["d", "u"], desc: "Half a screen down / up.  Ctrl+d and Ctrl+u do the same." },
+            { keys: ["PgDn", "PgUp"], desc: "Almost a full screen down / up." },
+            { keys: ["gg", "G"], desc: "Jump to the first / last page." },
+            { keys: ["40G", ":"], desc: "Go to a page. Type 40 for the number printed on the page (the PDF's own numbering), or iv, +5, -3, $ for the last page.",
+              action: function() { root.openCommand() } },
+            { keys: ["Ctrl+o", "Alt+←"], desc: "Jump back to where you were before following a link or a go-to.",
+              action: function() { root.goBack() } }
+        ] },
+        { title: "Search", items: [
+            { keys: ["/", "Ctrl+f"], desc: "Search the document, forward. Enter runs it.",
+              action: function() { root.openSearch(false) } },
+            { keys: ["?"], desc: "Search backward.", action: function() { root.openSearch(true) } },
+            { keys: ["n", "N"], desc: "Next / previous match (N goes the other way)." }
+        ] },
+        { title: "View", items: [
+            { keys: ["w"], desc: "Fit the page width to the window.", action: function() { root.fitWidth() } },
+            { keys: ["p"], desc: "Fit a whole page in the window.", action: function() { root.fitPage() } },
+            { keys: ["Ctrl+0"], desc: "Actual size (100%).", action: function() { root.zoom = 1.0 } },
+            { keys: ["=", "-"], desc: "Zoom in / out.", action: function() { root.zoomAt(view.width / 2, view.height / 2, 1.25) } },
+            { keys: ["D"], desc: "Cycle the layout: single page, two pages with the cover alone, two pages side by side from page 1.",
+              action: function() { root.cycleLayout() } },
+            { keys: ["r"], desc: "Rotate 90 degrees.", action: function() { root.rotateCW() } },
+            { keys: ["t"], desc: "Show page thumbnails.", action: function() { root.showThumbs = !root.showThumbs } },
+            { keys: ["T"], desc: "Show the table of contents (outline).", action: function() { root.toggleOutline() } },
+            { keys: ["f", "F11"], desc: "Full screen.", action: function() { root.toggleFullscreen() } }
+        ] },
+        { title: "Selecting and copying text", items: [
+            { keys: ["Drag"], desc: "Select text. This works on scanned pages and screenshots too: Glance reads them in the background as you browse." },
+            { keys: ["Double-click", "Triple-click"], desc: "Select a word (or a code identifier) / a whole line." },
+            { keys: ["Ctrl+a"], desc: "Select all the text on this page.", action: function() { root.selectAllOnPage() } },
+            { keys: ["c", "Ctrl+c"], desc: "Copy the selection, or the page as an image when nothing is selected.",
+              action: function() { root.copyPage() } },
+            { keys: ["Ctrl+Shift+o"], desc: "Read this page's text right now. Normally automatic.",
+              action: function() { root.recognizeCurrentPage() } }
+        ] },
+        { title: "Mouse and trackpad", items: [
+            { keys: ["Click a link"], desc: "Follow a PDF link. Web links open in your browser." },
+            { keys: ["Pinch", "Ctrl+wheel"], desc: "Zoom around the pointer." },
+            { keys: ["Space + drag"], desc: "Pan the page." },
+            { keys: ["Click the page number"], desc: "Same as pressing :  to go to a page.", action: function() { root.openCommand() } }
+        ] },
+        { title: "File", items: [
+            { keys: ["o"], desc: "Open a file.", action: function() { picker.open() } },
+            { keys: ["q", "Ctrl+q"], desc: "Quit.", action: function() { Qt.quit() } },
+            { keys: ["F1"], desc: "Show or hide this list." }
+        ] }
+    ]
+
+    MouseArea {   // click outside the panel to close it
+        anchors.fill: parent
+        visible: root.showKeys
+        z: 90
+        onClicked: root.showKeys = false
+    }
+
+    Rectangle {
+        id: keysPanel
+        visible: root.showKeys
+        z: 100
+        anchors.top: parent.top
+        anchors.topMargin: header.height + 6
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        width: Math.min(560, parent.width - 16)
+        height: Math.min(parent.height - header.height - 20, keysColumn.implicitHeight + 24)
+        radius: 10
+        color: Theme.darkerBackground
+        border.color: Theme.mutedForeground
+        border.width: 1
+
+        MouseArea { anchors.fill: parent }   // swallow clicks on the panel itself
+        onVisibleChanged: if (visible) keysFlick.contentY = 0
+
+        Flickable {
+            id: keysFlick
+            anchors.fill: parent
+            anchors.margins: 12
+            contentWidth: width
+            contentHeight: keysColumn.implicitHeight
+            clip: true
+            boundsBehavior: Flickable.StopAtBounds
+
+            Column {
+                id: keysColumn
+                width: keysFlick.width
+                spacing: 4
+
+                Text {
+                    text: "Keybindings"
+                    color: Theme.foreground
+                    font.pixelSize: 16
+                    font.weight: Font.DemiBold
+                    renderType: Text.QtRendering
+                }
+                Text {
+                    width: parent.width
+                    text: "Click any entry that has a pointing hand to run it. Esc or F1 closes this list."
+                    color: Theme.mutedForeground
+                    font.pixelSize: 11
+                    wrapMode: Text.WordWrap
+                    renderType: Text.QtRendering
+                    bottomPadding: 6
+                }
+
+                Repeater {
+                    model: root.keySections
+                    delegate: Column {
+                        width: keysColumn.width
+                        spacing: 2
+                        Text {
+                            text: modelData.title.toUpperCase()
+                            color: Theme.accent
+                            font.pixelSize: 10
+                            font.letterSpacing: 1
+                            font.weight: Font.DemiBold
+                            topPadding: 10
+                            bottomPadding: 2
+                            renderType: Text.QtRendering
+                        }
+                        Repeater {
+                            model: modelData.items
+                            delegate: Rectangle {
+                                id: keyRow
+                                width: parent.width
+                                height: Math.max(chips.implicitHeight, descText.implicitHeight) + 12
+                                radius: 6
+                                color: rowMouse.containsMouse && modelData.action
+                                       ? Theme.selection : "transparent"
+
+                                Flow {
+                                    id: chips
+                                    x: 6
+                                    y: 6
+                                    width: 150
+                                    spacing: 4
+                                    Repeater {
+                                        model: modelData.keys
+                                        delegate: Rectangle {
+                                            width: chipText.implicitWidth + 12
+                                            height: chipText.implicitHeight + 6
+                                            radius: 4
+                                            color: Theme.background
+                                            border.color: Theme.mutedForeground
+                                            border.width: 1
+                                            Text {
+                                                id: chipText
+                                                anchors.centerIn: parent
+                                                text: modelData
+                                                color: Theme.foreground
+                                                font.pixelSize: 11
+                                                font.family: "monospace"
+                                                renderType: Text.QtRendering
+                                            }
+                                        }
+                                    }
+                                }
+                                Text {
+                                    id: descText
+                                    x: 166
+                                    y: 6
+                                    width: parent.width - 166 - 8
+                                    text: modelData.desc
+                                    color: Theme.foreground
+                                    font.pixelSize: 12
+                                    wrapMode: Text.WordWrap
+                                    renderType: Text.QtRendering
+                                }
+                                MouseArea {
+                                    id: rowMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    enabled: !!modelData.action
+                                    cursorShape: modelData.action ? Qt.PointingHandCursor : Qt.ArrowCursor
+                                    onClicked: {
+                                        root.showKeys = false
+                                        modelData.action()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---------- shortcuts ----------
     // Single-key shortcuts are disabled while the search field has focus so
     // typing doesn't trigger navigation (or quit!).
     readonly property bool typing: searchField.activeFocus || cmdField.activeFocus
 
     Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
+    Shortcut { sequence: "F1"; onActivated: root.showKeys = !root.showKeys }
     Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
     Shortcut { sequence: "Ctrl+a"; enabled: !root.typing; onActivated: root.selectAllOnPage() }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
@@ -1977,7 +2173,9 @@ Window {
     Shortcut { sequence: "Escape"; onActivated: {
         root.vimCount = 0
         root.gPending = false
-        if (root.cmdActive)
+        if (root.showKeys)
+            root.showKeys = false
+        else if (root.cmdActive)
             root.closeCommand()
         else if (root.searchActive)
             root.closeSearch()
