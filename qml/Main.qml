@@ -1981,7 +1981,7 @@ Window {
     readonly property var keySections: [
         { title: "Move around", items: [
             { keys: ["j", "k"], desc: "Scroll down / up. Put a number first to repeat: 5j scrolls five steps." },
-            { keys: ["h", "l"], desc: "Scroll left / right when zoomed in." },
+            { keys: ["h", "l"], desc: "Scroll left / right. Only has an effect when the page is wider than the window, e.g. after zooming in." },
             { keys: ["J", "K"], desc: "Next / previous page (a whole spread in two-page view). 3J jumps three." },
             { keys: ["d", "u"], desc: "Half a screen down / up.  Ctrl+d and Ctrl+u do the same." },
             { keys: ["PgDn", "PgUp"], desc: "Almost a full screen down / up." },
@@ -2214,9 +2214,9 @@ Window {
                onActivated: root.scrollBy(-80 * root.takeCount(), 0) }
     Shortcut { sequence: "l"; enabled: !root.typing
                onActivated: root.scrollBy(80 * root.takeCount(), 0) }
-    Shortcut { sequence: "J"; enabled: !root.typing
+    Shortcut { sequence: "Shift+j"; enabled: !root.typing
                onActivated: root.jumpTo(root.currentPage + root.takeCount() * root.pagesPerRow, false) }
-    Shortcut { sequence: "K"; enabled: !root.typing
+    Shortcut { sequence: "Shift+k"; enabled: !root.typing
                onActivated: root.jumpTo(Math.max(1, root.currentPage - root.takeCount() * root.pagesPerRow), false) }
     Shortcut { sequence: "d"; enabled: !root.typing
                onActivated: root.scrollBy(0, view.height / 2 * root.takeCount()) }
@@ -2245,7 +2245,7 @@ Window {
             gPendingTimer.restart()
         }
     } }
-    Shortcut { sequence: "G"; enabled: !root.typing; onActivated: {
+    Shortcut { sequence: "Shift+g"; enabled: !root.typing; onActivated: {
         if (root.vimCount > 0) {
             root.gotoPage(String(root.takeCount()))
         } else {
@@ -2268,7 +2268,7 @@ Window {
         }
     }
 
-    Shortcut { sequence: "T"; enabled: !root.typing; onActivated: root.toggleOutline() }
+    Shortcut { sequence: "Shift+t"; enabled: !root.typing; onActivated: root.toggleOutline() }
     Shortcut { sequence: "c"; enabled: !root.typing; onActivated: root.copyPage() }
     Shortcut { sequence: "f"; enabled: !root.typing; onActivated: root.toggleFullscreen() }
     Shortcut { sequence: "F11"; onActivated: root.toggleFullscreen() }
@@ -2278,7 +2278,7 @@ Window {
     Shortcut { sequence: "p"; enabled: !root.typing; onActivated: root.fitPage() }
     Shortcut { sequence: "Ctrl+0"; onActivated: root.zoom = 1.0 }
     Shortcut { sequence: "r"; enabled: !root.typing; onActivated: root.rotateCW() }
-    Shortcut { sequence: "D"; enabled: !root.typing; onActivated: root.cycleLayout() }
+    Shortcut { sequence: "Shift+d"; enabled: !root.typing; onActivated: root.cycleLayout() }
     Shortcut { sequence: "t"; enabled: !root.typing; onActivated: root.showThumbs = !root.showThumbs }
     Shortcut { sequence: "o"; enabled: !root.typing; onActivated: picker.open() }
 
