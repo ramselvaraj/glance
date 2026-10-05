@@ -64,6 +64,8 @@ same command after updating Glance. To remove the installed files:
 | `40G`, `:40` | go to page 40: the printed page number if the PDF has page labels, else the PDF page; `:iv`, `:+5`, `:$` also work |
 | / and ? | search forward / backward (Ctrl+f also searches); n/N next/previous match |
 | click the page number | same as `:` |
+| Ctrl+o / Alt+Left | jump back after following a link or a go-to |
+| D / `2` button | cycle single page, two-page (cover alone), two-page (no cover offset); J/K then move a spread at a time |
 | +/− | zoom |
 | w/p/Ctrl+0 | fit width / fit page / 100% |
 | r | rotate 90° |
@@ -73,6 +75,11 @@ same command after updating Glance. To remove the installed files:
 | Ctrl+Shift+o | recognize text on the current scanned page/image |
 | Ctrl+c | copy selected text, or the current page when nothing is selected |
 | q | quit |
+
+Links in a PDF are clickable (hover tints them); web links open in your browser.
+Glance remembers the page, position, zoom, rotation and page layout for each file.
+Double-click selects the identifier or punctuation run under the pointer, not the
+whole whitespace-separated chunk.
 
 Touchpad: two-finger scroll = kinetically scrolled viewport; two-finger pinch =
 zoom around gesture center; Ctrl+wheel also zooms.

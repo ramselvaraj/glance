@@ -431,6 +431,8 @@ QVariantMap Document::loadViewState() const
     state.insert(QStringLiteral("zoom"), settings.value(QStringLiteral("zoom")).toDouble());
     state.insert(QStringLiteral("fit"), settings.value(QStringLiteral("fit")).toBool());
     state.insert(QStringLiteral("rotation"), settings.value(QStringLiteral("rotation")).toInt());
+    state.insert(QStringLiteral("perRow"), settings.value(QStringLiteral("perRow"), 1).toInt());
+    state.insert(QStringLiteral("cover"), settings.value(QStringLiteral("cover"), true).toBool());
     return state;
 }
 

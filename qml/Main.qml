@@ -61,10 +61,20 @@ Window {
     property string hoverRegionKey: ""
     property int perfFrames: 0
     property var pageSizes: []
-    property var prefixHpt: []   // cumulative ptH before page i (upright)
-    property var prefixWpt: []   // cumulative ptW before page i (sideways)
-    property real maxPageW: 612
-    property real maxPageH: 792
+    // Layout: the document is a list of rows of 1 (single) or 2 (two-page) pages.
+    property int pagesPerRow: 1
+    property bool coverAlone: true          // two-page: page 1 sits alone, then pairs
+    property var rowOfPage: []              // page -> row
+    property var rowFirstPage: []           // row -> first page
+    property var rowHUp: []                 // row height in points (upright)
+    property var rowHSide: []               // row height in points (rotated 90/270)
+    property var rowPrefixHUp: []           // cumulative row heights before row r
+    property var rowPrefixHSide: []
+    property real maxRowWUp: 612
+    property real maxRowWSide: 792
+    property real maxRowHUp: 792
+    property real maxRowHSide: 612
+    readonly property real spreadGap: 8     // points between the two pages of a row
 
     readonly property real pageGap: 12
     readonly property real pageTopPadding: 12
@@ -93,8 +103,7 @@ Window {
     }
 
     function pageTop(page) { // page is 1-based
-        const it = pagesCol.children[page - 1]
-        return it ? pagesCol.y + it.y : 0
+        return pageTopAt(page - 1, zoom)
     }
 
     function nowMs() {
@@ -105,24 +114,23 @@ Window {
         }
     }
 
-    // Page under the 40% line of the viewport. Starts from the current page so
-    // scrolling costs O(pages moved), not O(page count).
+    // Page under the 40% line of the viewport (the first page of its row).
     function detectPage() {
-        const n = pageCount
-        if (n === 0)
+        const rows = rowFirstPage.length
+        if (rows === 0)
             return
         const midY = view.contentY + view.height * 0.4
-        let i = Math.max(0, Math.min(n - 1, currentPage - 1))
-        const bottom = idx => {
-            const it = pagesCol.children[idx]
-            return it ? pagesCol.y + it.y + it.height : Number.MAX_VALUE
+        let lo = 0, hi = rows - 1
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1
+            if (rowTopAt(mid, zoom) <= midY)
+                lo = mid
+            else
+                hi = mid - 1
         }
-        while (i > 0 && midY < bottom(i - 1))
-            --i
-        while (i < n - 1 && midY >= bottom(i))
-            ++i
-        if (currentPage !== i + 1)
-            currentPage = i + 1
+        const page = rowFirstPage[lo] + 1
+        if (currentPage !== page)
+            currentPage = page
     }
 
     // Jump list so a followed link (or a :goto) can be undone with Ctrl+o.
@@ -177,26 +185,133 @@ Window {
             return 792
         return sideways() ? s.width : s.height
     }
+    function sheetWpt(i) { // page width in points, rotation-aware
+        const s = pageSizes[i]
+        if (!s)
+            return 612
+        return sideways() ? s.height : s.width
+    }
+    function colWpt() { return sideways() ? maxRowWSide : maxRowWUp }
+    function colHpt() { return sideways() ? maxRowHSide : maxRowHUp }
     function colW(z) { // width of the page column at zoom z
-        return (sideways() ? maxPageH : maxPageW) * z
+        return colWpt() * z
     }
     function colX(z) { // left edge of the page column in content coords
         const cw = colW(z)
         return (Math.max(view.width, cw) - cw) / 2
     }
-    function prefixAt(i) { // cumulative page height (pt) before page i
-        const arr = sideways() ? prefixWpt : prefixHpt
-        return arr[i] || 0
+    function rowOf(i) {
+        return rowOfPage[i] || 0
     }
-    function pageTopAt(i, z) {
-        return pageTopPadding + pageGap * i + prefixAt(i) * z
+    function rowHeightPt(r) {
+        return (sideways() ? rowHSide[r] : rowHUp[r]) || 792
+    }
+    function rowPrefixAt(r) { // cumulative row height (pt) before row r
+        const arr = sideways() ? rowPrefixHSide : rowPrefixHUp
+        return arr[r] || 0
+    }
+    function rowTopAt(r, z) {
+        return pageTopPadding + pageGap * r + rowPrefixAt(r) * z
+    }
+    function pageTopAt(i, z) { // top of the page's row
+        return rowTopAt(rowOf(i), z)
+    }
+    function rowPages(r) { // [first, endExclusive)
+        const first = rowFirstPage[r] || 0
+        return [first, r + 1 < rowFirstPage.length ? rowFirstPage[r + 1] : pageCount]
+    }
+    function pageXAt(i) { // left of the page within the column, in points
+        const r = rowOf(i)
+        const span = rowPages(r)
+        let rowW = spreadGap * (span[1] - span[0] - 1)
+        let before = 0
+        for (let p = span[0]; p < span[1]; ++p) {
+            rowW += sheetWpt(p)
+            if (p < i)
+                before += sheetWpt(p) + spreadGap
+        }
+        return (colWpt() - rowW) / 2 + before
+    }
+    function pageYOffsetPt(i) { // vertical centring inside a row, in points
+        return (rowHeightPt(rowOf(i)) - sheetHpt(i)) / 2
     }
     function totalH(z) {
-        const n = pageCount
-        if (n === 0)
+        const rows = rowFirstPage.length
+        if (rows === 0)
             return 0
-        return pageTopPadding + pageGap * (n - 1) + prefixAt(n) * z + pageBottomPadding
+        return pageTopPadding + pageGap * (rows - 1) + rowPrefixAt(rows) * z + pageBottomPadding
     }
+
+    function rebuildLayout() {
+        const n = pageCount
+        const rows = []
+        let i = 0
+        if (pagesPerRow === 2 && coverAlone && n > 0) {
+            rows.push([0])
+            i = 1
+        }
+        while (i < n) {
+            const row = pagesPerRow === 2 && i + 1 < n ? [i, i + 1] : [i]
+            rows.push(row)
+            i += row.length
+        }
+        const ofPage = [], first = [], hUp = [], hSide = [], pUp = [0], pSide = [0]
+        let wUp = pagesPerRow === 1 ? 612 : 0, wSide = pagesPerRow === 1 ? 792 : 0
+        let mhUp = pagesPerRow === 1 ? 792 : 0, mhSide = pagesPerRow === 1 ? 612 : 0
+        for (let r = 0; r < rows.length; ++r) {
+            let rhUp = 0, rhSide = 0, rwUp = spreadGap * (rows[r].length - 1)
+            let rwSide = rwUp
+            for (const p of rows[r]) {
+                const s = pageSizes[p] || { width: 612, height: 792 }
+                ofPage[p] = r
+                rhUp = Math.max(rhUp, s.height)
+                rhSide = Math.max(rhSide, s.width)
+                rwUp += s.width
+                rwSide += s.height
+            }
+            first.push(rows[r][0])
+            hUp.push(rhUp)
+            hSide.push(rhSide)
+            pUp.push(pUp[r] + rhUp)
+            pSide.push(pSide[r] + rhSide)
+            wUp = Math.max(wUp, rwUp)
+            wSide = Math.max(wSide, rwSide)
+            mhUp = Math.max(mhUp, rhUp)
+            mhSide = Math.max(mhSide, rhSide)
+        }
+        rowOfPage = ofPage
+        rowFirstPage = first
+        rowHUp = hUp
+        rowHSide = hSide
+        rowPrefixHUp = pUp
+        rowPrefixHSide = pSide
+        maxRowWUp = wUp
+        maxRowWSide = wSide
+        maxRowHUp = mhUp
+        maxRowHSide = mhSide
+    }
+
+    // single -> two-page (cover alone) -> two-page (no cover offset) -> single
+    function cycleLayout() {
+        if (pageCount < 2)
+            return
+        const pos = viewPosition()
+        if (pagesPerRow === 1) {
+            pagesPerRow = 2
+            coverAlone = true
+        } else if (coverAlone) {
+            coverAlone = false
+        } else {
+            pagesPerRow = 1
+        }
+        rebuildLayout()
+        autoFitSinglePage = false
+        zoom = fitWidthZoom()
+        scrollTimer.page = pos.page
+        scrollTimer.offset = pos.offset
+        scrollTimer.start()
+    }
+
     function clampZoom(z) {
         return Math.min(8.0, Math.max(0.2, z))
     }
@@ -266,7 +381,7 @@ Window {
     property bool viewStateReady: false
     property bool autoFitSinglePage: false
     function fitWidthZoom() {
-        return Math.min(8.0, Math.max(0.2, (view.width - 24) / root.maxPageW))
+        return Math.min(8.0, Math.max(0.2, (view.width - 24) / root.colWpt()))
     }
 
     // Top-of-viewport page index and fraction of that page already scrolled past.
@@ -290,7 +405,7 @@ Window {
         const pos = viewPosition()
         Doc.saveViewState({ page: pos.page, offset: pos.offset, zoom: zoom,
                             fit: Math.abs(zoom - fitWidthZoom()) < 0.005,
-                            rotation: rotation })
+                            rotation: rotation, perRow: pagesPerRow, cover: coverAlone })
     }
 
     function beginViewRestore() {
@@ -318,8 +433,8 @@ Window {
     function fitPage() {
         if (pageCount === 0)
             return
-        const w = (view.width - 24) / maxPageW
-        const h = (view.height - 24) / maxPageH
+        const w = (view.width - 24) / colWpt()
+        const h = (view.height - 24) / colHpt()
         zoom = Math.min(8.0, Math.max(0.2, Math.min(w, h)))
     }
 
@@ -741,25 +856,37 @@ Window {
         if (pageCount === 0)
             return null
         const contentY = view.contentY + viewPoint.y
-        let page = 0
-        for (let i = 0; i < pageCount; ++i) {
-            const item = pageRepeater.itemAt(i)
-            if (!item)
+        const contentX = view.contentX + viewPoint.x
+        const rows = rowFirstPage.length
+        // Row under (or nearest to) the pointer.
+        let lo = 0, hi = rows - 1
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1
+            if (rowTopAt(mid, zoom) <= contentY)
+                lo = mid
+            else
+                hi = mid - 1
+        }
+        let row = lo
+        const rowBottom = rowTopAt(row, zoom) + rowHeightPt(row) * zoom
+        if (contentY > rowBottom && row + 1 < rows
+                && rowTopAt(row + 1, zoom) - contentY < contentY - rowBottom)
+            row += 1
+        // Page within the row: nearest horizontally.
+        const span = rowPages(row)
+        let page = span[0]
+        let best = Number.MAX_VALUE
+        for (let p = span[0]; p < span[1]; ++p) {
+            const it = pageRepeater.itemAt(p)
+            if (!it)
                 continue
-            const top = pagesCol.y + item.y
-            const bottom = top + item.height
-            if (contentY <= bottom) {
-                if (contentY < top && i > 0) {
-                    const previous = pageRepeater.itemAt(i - 1)
-                    const previousBottom = pagesCol.y + previous.y + previous.height
-                    page = contentY - previousBottom < top - contentY ? i - 1 : i
-                } else {
-                    page = i
-                }
-                break
+            const left = pagesCol.x + it.x
+            const right = left + it.width
+            const dx = contentX < left ? left - contentX : (contentX > right ? contentX - right : 0)
+            if (dx < best) {
+                best = dx
+                page = p
             }
-            if (i === pageCount - 1)
-                page = i
         }
         const item = pageRepeater.itemAt(page)
         if (!item)
@@ -1096,27 +1223,10 @@ Window {
     function computeSizes() {
         const n = Doc.pageCount
         const sizes = []
-        const prefixH = []
-        const prefixW = []
-        let maxW = 612, maxH = 792
-        let accH = 0, accW = 0
-        for (let i = 0; i < n; ++i) {
-            const s = Doc.pageSizePt(i)
-            sizes.push(s)
-            prefixH.push(accH)
-            prefixW.push(accW)
-            accH += s.height
-            accW += s.width
-            maxW = Math.max(maxW, s.width)
-            maxH = Math.max(maxH, s.height)
-        }
-        prefixH.push(accH)
-        prefixW.push(accW)
+        for (let i = 0; i < n; ++i)
+            sizes.push(Doc.pageSizePt(i))
         pageSizes = sizes
-        prefixHpt = prefixH
-        prefixWpt = prefixW
-        maxPageW = maxW
-        maxPageH = maxH
+        rebuildLayout()
         if (n > 0) {
             autoFitSinglePage = (n === 1)
             fitWidth(true)
@@ -1338,6 +1448,8 @@ Window {
             HeaderButton { label: "w"; tip: "fit width"; onActivated: root.fitWidth() }
             HeaderButton { label: "p"; tip: "fit page"; onActivated: root.fitPage() }
             HeaderButton { label: "1"; tip: "100%"; onActivated: root.zoom = 1.0 }
+            HeaderButton { label: "2"; tip: "two-page view"; activeFlag: root.pagesPerRow === 2
+                           onActivated: root.cycleLayout() }
             HeaderButton { label: "r"; tip: "rotate"; onActivated: root.rotateCW() }
             HeaderButton { label: "t"; tip: "thumbnails"; activeFlag: root.showThumbs;
                            onActivated: root.showThumbs = !root.showThumbs }
@@ -1381,13 +1493,12 @@ Window {
             onHeightChanged: root.detectPage()
             onContentHeightChanged: root.detectPage()
 
-            Column {
+            Item {
                 id: pagesCol
                 x: colX(root.zoom)
                 width: colW(root.zoom)
-                spacing: 12
-                topPadding: 12
-                bottomPadding: 16
+                height: root.totalH(root.zoom)
+                implicitHeight: height
                 transform: Scale {
                     origin.x: root.pinchAnchorContentX - pagesCol.x
                     origin.y: root.pinchAnchorContentY - pagesCol.y
@@ -1400,11 +1511,12 @@ Window {
                     model: Doc.pageCount
                     delegate: Item {
                         id: pageSlot
-                        width: pagesCol.width
-                        height: (root.sideways()
-                                 ? (root.pageSizes[index] ? root.pageSizes[index].width : 612)
-                                 : (root.pageSizes[index] ? root.pageSizes[index].height : 792))
-                                * root.zoom
+                        x: root.pagesPerRow === 1 ? 0 : root.pageXAt(index) * root.zoom
+                        y: root.pageTopAt(index, root.zoom)
+                           + (root.pagesPerRow === 1 ? 0 : root.pageYOffsetPt(index) * root.zoom)
+                        width: root.pagesPerRow === 1 ? pagesCol.width
+                                                      : root.sheetWpt(index) * root.zoom
+                        height: root.sheetHpt(index) * root.zoom
                         readonly property bool nearView: y + height >= view.contentY - 1000
                                                          && y <= view.contentY + view.height
                                                                  + (root.pinchPreviewActive ? 5000 : 2600)
@@ -1851,9 +1963,9 @@ Window {
     Shortcut { sequence: "l"; enabled: !root.typing
                onActivated: root.scrollBy(80 * root.takeCount(), 0) }
     Shortcut { sequence: "J"; enabled: !root.typing
-               onActivated: root.jumpTo(root.currentPage + root.takeCount(), false) }
+               onActivated: root.jumpTo(root.currentPage + root.takeCount() * root.pagesPerRow, false) }
     Shortcut { sequence: "K"; enabled: !root.typing
-               onActivated: root.jumpTo(Math.max(1, root.currentPage - root.takeCount()), false) }
+               onActivated: root.jumpTo(Math.max(1, root.currentPage - root.takeCount() * root.pagesPerRow), false) }
     Shortcut { sequence: "d"; enabled: !root.typing
                onActivated: root.scrollBy(0, view.height / 2 * root.takeCount()) }
     Shortcut { sequence: "u"; enabled: !root.typing
@@ -1914,6 +2026,7 @@ Window {
     Shortcut { sequence: "p"; enabled: !root.typing; onActivated: root.fitPage() }
     Shortcut { sequence: "Ctrl+0"; onActivated: root.zoom = 1.0 }
     Shortcut { sequence: "r"; enabled: !root.typing; onActivated: root.rotateCW() }
+    Shortcut { sequence: "D"; enabled: !root.typing; onActivated: root.cycleLayout() }
     Shortcut { sequence: "t"; enabled: !root.typing; onActivated: root.showThumbs = !root.showThumbs }
     Shortcut { sequence: "o"; enabled: !root.typing; onActivated: picker.open() }
 
@@ -1931,9 +2044,19 @@ Window {
             }
             if (st.rotation !== undefined)
                 root.rotation = Number(st.rotation)
+            let layoutChanged = false
+            if (st.perRow !== undefined && Number(st.perRow) === 2 && root.pageCount > 1) {
+                root.pagesPerRow = 2
+                root.coverAlone = st.cover !== false
+                root.rebuildLayout()
+                layoutChanged = true
+            }
             if (st.fit !== true && Number(st.zoom) > 0) {
                 root.autoFitSinglePage = false
                 root.zoom = root.clampZoom(Number(st.zoom))
+            } else if (layoutChanged) {
+                root.autoFitSinglePage = false
+                root.zoom = root.fitWidthZoom()
             }
             scrollTimer.page = Math.max(0, Math.min(root.pageCount - 1, Number(st.page)))
             scrollTimer.offset = Number(st.offset) || 0
