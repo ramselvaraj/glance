@@ -67,7 +67,7 @@ void OcrManager::connectWorker()
         m_workerRequestActive = false;
         m_workerFailed = true;
         if (m_isPdf)
-            startTesseract();
+            fallbackToTesseract();
         else
             finishWithError(QStringLiteral("RapidOCR worker stopped"));
     });
@@ -89,8 +89,22 @@ void OcrManager::prewarm()
         m_worker.start();
 }
 
+QString OcrManager::pageCacheKey(const QString &backend, const QString &tag) const
+{
+    const QFileInfo info(m_path);
+    return QStringLiteral("v8|%1|%2|%3|%4|%5|%6|%7|eng|200")
+        .arg(backend)
+        .arg(info.canonicalFilePath())
+        .arg(info.size())
+        .arg(info.lastModified().toMSecsSinceEpoch())
+        .arg(m_page)
+        .arg(QString::number(m_pageSize.width(), 'f', 2)
+             + QLatin1Char('x') + QString::number(m_pageSize.height(), 'f', 2))
+        .arg(tag);
+}
+
 void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
-                           int generation)
+                           int generation, const QVariantList &regions)
 {
     cancel();
     prewarm();
@@ -99,16 +113,38 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
     m_workerFailed = false;
     m_fallbackPass = false;
     m_region = QRectF();
-    const QString backend = !m_isPdf && m_workerAvailable && m_workerIsRapid
-        ? QStringLiteral("rapidocr-3.9.2") : QStringLiteral("tesseract-5");
-    m_cacheKey = QStringLiteral("v7|%1|%2|%3|%4|%5|%6|eng|200")
-        .arg(backend)
-        .arg(QFileInfo(path).canonicalFilePath())
-        .arg(QFileInfo(path).size())
-        .arg(QFileInfo(path).lastModified().toMSecsSinceEpoch())
-        .arg(page)
-        .arg(QString::number(pageSize.width(), 'f', 2)
-             + QLatin1Char('x') + QString::number(pageSize.height(), 'f', 2));
+    m_accum.clear();
+    m_jobs.clear();
+    m_jobIndex = 0;
+    m_rapidMode = m_isPdf && m_workerAvailable && m_workerIsRapid;
+
+    if (m_rapidMode) {
+        const QRectF pageRect(QPointF(0, 0), pageSize);
+        QStringList tag;
+        for (const QVariant &v : regions) {
+            const QVariantMap r = v.toMap();
+            const QRectF rect = QRectF(r.value(QStringLiteral("x")).toDouble(),
+                                       r.value(QStringLiteral("y")).toDouble(),
+                                       r.value(QStringLiteral("w")).toDouble(),
+                                       r.value(QStringLiteral("h")).toDouble())
+                                    .intersected(pageRect);
+            if (rect.width() < 4 || rect.height() < 4)
+                continue;
+            m_jobs.append(rect);
+            tag << QStringLiteral("%1,%2,%3,%4").arg(rect.x(), 0, 'f', 0).arg(rect.y(), 0, 'f', 0)
+                       .arg(rect.width(), 0, 'f', 0).arg(rect.height(), 0, 'f', 0);
+        }
+        if (m_jobs.isEmpty()) {
+            m_jobs.append(pageRect);
+            tag << QStringLiteral("page");
+        }
+        m_regionsTag = tag.join(QLatin1Char(';'));
+        m_cacheKey = pageCacheKey(QStringLiteral("rapidocr-3.9.2"), m_regionsTag);
+    } else {
+        m_regionsTag.clear();
+        m_cacheKey = pageCacheKey(QStringLiteral("tesseract-5"), QString());
+    }
+
     Result result;
     const auto cached = m_cache.constFind(m_cacheKey);
     if (m_cacheEnabled
@@ -134,15 +170,73 @@ void OcrManager::recognize(const QString &path, int page, QSizeF pageSize,
         startRecognition();
         return;
     }
+    if (m_rapidMode)
+        startNextJob();
+    else
+        startPageRender();
+}
+
+// Whole page at 200 dpi for Tesseract.
+void OcrManager::startPageRender()
+{
     m_stage = Stage::Rendering;
+    m_scaleX = m_scaleY = 72.0 / 200.0;
     const QString prefix = m_tempDir.filePath(QStringLiteral("page"));
     m_process.setProgram(QStringLiteral("nice"));
     m_process.setArguments({QStringLiteral("-n"), QStringLiteral("10"),
                             QStringLiteral("pdftoppm"), QStringLiteral("-f"),
-                            QString::number(page + 1), QStringLiteral("-l"),
-                            QString::number(page + 1), QStringLiteral("-r"),
-                            QStringLiteral("200"), QStringLiteral("-singlefile"), path, prefix});
+                            QString::number(m_page + 1), QStringLiteral("-l"),
+                            QString::number(m_page + 1), QStringLiteral("-r"),
+                            QStringLiteral("200"),
+                            QStringLiteral("-singlefile"), m_path, prefix});
     m_process.start();
+}
+
+// RapidOCR: render the next crop at 200 dpi, then send it to the worker.
+void OcrManager::startNextJob()
+{
+    const QRectF rect = m_jobs.at(m_jobIndex);
+    const qreal pxPerPt = 200.0 / 72.0;
+    const int px = qFloor(rect.x() * pxPerPt);
+    const int py = qFloor(rect.y() * pxPerPt);
+    const int pw = qMax(1, qCeil(rect.right() * pxPerPt) - px);
+    const int ph = qMax(1, qCeil(rect.bottom() * pxPerPt) - py);
+    m_jobOffsetX = px / pxPerPt;
+    m_jobOffsetY = py / pxPerPt;
+    m_scaleX = m_scaleY = 72.0 / 200.0;
+    setProgress(5 + 40 * m_jobIndex / int(m_jobs.size()));
+    m_stage = Stage::Rendering;
+    QFile::remove(m_tempDir.filePath(QStringLiteral("page.ppm")));
+    m_process.setProgram(QStringLiteral("nice"));
+    m_process.setArguments({QStringLiteral("-n"), QStringLiteral("10"),
+                            QStringLiteral("pdftoppm"), QStringLiteral("-f"),
+                            QString::number(m_page + 1), QStringLiteral("-l"),
+                            QString::number(m_page + 1), QStringLiteral("-r"),
+                            QStringLiteral("200"),
+                            QStringLiteral("-x"), QString::number(px),
+                            QStringLiteral("-y"), QString::number(py),
+                            QStringLiteral("-W"), QString::number(pw),
+                            QStringLiteral("-H"), QString::number(ph),
+                            QStringLiteral("-singlefile"), m_path,
+                            m_tempDir.filePath(QStringLiteral("page"))});
+    m_process.start();
+}
+
+// RapidOCR is unavailable or failed mid-page: redo the whole page with Tesseract.
+void OcrManager::fallbackToTesseract()
+{
+    if (m_cancelled)
+        return;
+    const bool wasRapid = m_rapidMode;
+    m_rapidMode = false;
+    m_workerFailed = true;
+    m_accum.clear();
+    if (!wasRapid) {
+        startTesseract();   // page.ppm already holds the full page
+        return;
+    }
+    m_cacheKey = pageCacheKey(QStringLiteral("tesseract-5"), QString());
+    startPageRender();
 }
 
 void OcrManager::begin(const QString &path, int page, QSizeF pageSize, int generation)
@@ -328,6 +422,12 @@ void OcrManager::setProgress(int progress)
 
 void OcrManager::startRecognition()
 {
+    if (m_rapidMode) {
+        if (!m_workerFailed && !m_workerRequestActive && startWorkerRequest())
+            return;
+        fallbackToTesseract();
+        return;
+    }
     if (m_isPdf) {
         startTesseract();
         return;
@@ -403,13 +503,13 @@ void OcrManager::handleWorkerOutput()
         if (!error.isEmpty()) {
             m_workerFailed = true;
             if (m_isPdf)
-                startTesseract();
+                fallbackToTesseract();
             else
                 finishWithError(error);
             return;
         }
         QVariantList words = object.value(QStringLiteral("words")).toArray().toVariantList();
-        if (words.isEmpty()) {
+        if (words.isEmpty() && !m_rapidMode) {
             if (m_isPdf) {
                 m_workerFailed = true;
                 startTesseract();
@@ -420,8 +520,10 @@ void OcrManager::handleWorkerOutput()
         }
         for (QVariant &value : words) {
             QVariantMap word = value.toMap();
-            const qreal offsetX = m_isRegion ? m_region.x() : 0;
-            const qreal offsetY = m_isRegion ? m_region.y() : 0;
+            const qreal offsetX = m_isRegion ? m_region.x() : (m_rapidMode ? m_jobOffsetX : 0);
+            const qreal offsetY = m_isRegion ? m_region.y() : (m_rapidMode ? m_jobOffsetY : 0);
+            if (m_rapidMode)
+                word[QStringLiteral("block")] = m_jobIndex;
             word[QStringLiteral("x")] = word.value(QStringLiteral("x")).toDouble() * m_scaleX + offsetX;
             word[QStringLiteral("y")] = word.value(QStringLiteral("y")).toDouble() * m_scaleY + offsetY;
             word[QStringLiteral("w")] = word.value(QStringLiteral("w")).toDouble() * m_scaleX;
@@ -437,6 +539,14 @@ void OcrManager::handleWorkerOutput()
             }
             word[QStringLiteral("chars")] = chars;
             value = word;
+        }
+        if (m_rapidMode) {
+            m_accum.append(words);
+            if (++m_jobIndex < m_jobs.size()) {
+                startNextJob();
+                return;
+            }
+            words = m_accum;   // an empty page is a valid (cached) result, not an error
         }
         setProgress(100);
         setRunning(false);

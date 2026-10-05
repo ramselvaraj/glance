@@ -115,14 +115,22 @@ int main(int argc, char *argv[])
             .toInt(&pageOk) - 1;
         if (!pageOk || ocrPage < 0 || ocrPage >= doc->pageCount())
             return 1;
+        // Same rule as the viewer: crops of the embedded images when the page
+        // already has native text, otherwise the whole page.
+        const QVariantList ocrRegions = doc->pageHasText(ocrPage)
+            ? doc->pageImageRects(ocrPage) : QVariantList();
         auto *timer = new QElapsedTimer;
         auto *pass = new int(0);
         timer->start();
         QObject::connect(&ocr, &OcrManager::finished, &app,
-                         [&app, &ocr, doc, filePath, ocrPage, cancelTest, timer, pass](int generation, int page, const QString &text,
+                         [&app, &ocr, doc, filePath, ocrPage, ocrRegions, cancelTest, timer, pass](int generation, int page, const QString &text,
                                  const QVariantList &words, const QString &error) {
             if (cancelTest && generation != 2)
                 return;
+            fprintf(stderr, "ocr-selftest: rapid=%d regions=%d first-block=%d text='%s'\n",
+                    int(ocr.rapidAvailable()), int(ocrRegions.size()),
+                    words.isEmpty() ? -1 : words.first().toMap().value("block").toInt(),
+                    text.left(70).replace('\n', ' ').toUtf8().constData());
             fprintf(stderr, "ocr-selftest: pass=%d page=%d chars=%d words=%d ms=%lld error='%s'\n",
                     *pass + 1,
                     page + 1, int(text.size()), int(words.size()),
@@ -146,7 +154,7 @@ int main(int argc, char *argv[])
             }
             if (!cancelTest && (*pass)++ == 0) {
                 timer->restart();
-                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2);
+                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
                 return;
             }
             app.exit(0);
@@ -155,12 +163,12 @@ int main(int argc, char *argv[])
             ocr.cancel();
             app.exit(3);
         });
-        ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 1);
+        ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 1, ocrRegions);
         if (cancelTest) {
-            QTimer::singleShot(25, &app, [&ocr, doc, filePath, ocrPage, timer] {
+            QTimer::singleShot(25, &app, [&ocr, doc, filePath, ocrPage, ocrRegions, timer] {
                 ocr.cancel();
                 timer->restart();
-                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2);
+                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
             });
         }
         return app.exec();
@@ -238,6 +246,18 @@ int main(int argc, char *argv[])
                         int(l["external"].toBool()), l["page"].toInt(), l["destY"].toDouble(),
                         l["uri"].toString().left(50).toUtf8().constData());
             }
+        }
+        for (int probe : {11, 19, 32, 33}) {
+            if (probe >= doc->pageCount())
+                continue;
+            const QVariantList rects = doc->pageImageRects(probe);
+            fprintf(stderr, "selftest: page %d image rects=%d", probe + 1, int(rects.size()));
+            for (const QVariant &v : rects) {
+                const QVariantMap r = v.toMap();
+                fprintf(stderr, " (%.0f,%.0f %.0fx%.0f)", r["x"].toDouble(), r["y"].toDouble(),
+                        r["w"].toDouble(), r["h"].toDouble());
+            }
+            fprintf(stderr, "\n");
         }
         fprintf(stderr, "selftest: page0 text=%s images=%s\n",
                 doc->pageHasText(0) ? "yes" : "no",

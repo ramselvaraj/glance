@@ -961,26 +961,43 @@ Window {
         const capabilities = Object.assign({}, pageTextCapabilities)
         capabilities[page] = hasText
         pageTextCapabilities = capabilities
-        if (hasText && explicit) {
+        // With RapidOCR a PDF page is read as crops: each embedded image when the
+        // page already has native text, or the whole page when it has none.
+        const cropMode = Ocr.rapidAvailable && !isImageDoc
+        const size = Doc.pageSizePt(page)
+        let regions = []
+        let nativeChars = 0
+        if (hasText) {
+            const nativeSelection = Doc.selectText(page, Qt.point(0, 0),
+                                                    Qt.point(size.width, size.height))
+            nativeChars = nativeSelection.text.length
+            const boxes = Object.assign({}, nativePageBoxes)
+            boxes[page] = nativeSelection.boxes
+            nativePageBoxes = boxes
+            if (cropMode) {
+                // A full-page backdrop behind a text-rich page is not worth reading.
+                regions = Doc.pageImageRects(page).filter(r =>
+                    nativeChars < 200 || r.w * r.h < 0.85 * size.width * size.height)
+            }
+        }
+        if (hasText && explicit && regions.length === 0) {
             ocrStatus = "page already has selectable text"
             return false
         }
         if (hasText) {
-            const size = Doc.pageSizePt(page)
-            const nativeSelection = Doc.selectText(page, Qt.point(0, 0),
-                                                    Qt.point(size.width, size.height))
-            const boxes = Object.assign({}, nativePageBoxes)
-            boxes[page] = nativeSelection.boxes
-            nativePageBoxes = boxes
-            if (!Doc.pageHasImages(page) || nativeSelection.text.length >= 200)
+            if (cropMode) {
+                if (regions.length === 0)
+                    return false
+            } else if (!Doc.pageHasImages(page) || nativeChars >= 200) {
                 return false
+            }
         }
         ocrGeneration += 1
         ocrRequestedPage = page
         ocrExplicit = explicit
         if (explicit)
             ocrStatus = "recognizing page " + (page + 1)
-        Ocr.recognize(Doc.filePath, page, Doc.pageSizePt(page), ocrGeneration)
+        Ocr.recognize(Doc.filePath, page, size, ocrGeneration, regions)
         return true
     }
 
@@ -1030,7 +1047,9 @@ Window {
     }
 
     function requestRegionalOcr(selection) {
-        if (!selection || isImageDoc)
+        // Hover OCR is only the Tesseract fallback; with RapidOCR whole pages
+        // (or their images) are read up front instead.
+        if (!selection || isImageDoc || Ocr.rapidAvailable)
             return false
         const hasNativeText = pageTextCapabilities[selection.page] === true
         if (hasNativeText && nativePointHasText(selection.page, selection.point))

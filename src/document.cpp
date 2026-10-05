@@ -275,6 +275,7 @@ void Document::reset()
 {
     m_labels.clear();
     m_labelsBuilt = false;
+    m_imageRectCache.clear();
     cancelSearch();
     m_textPool.waitForDone();
     m_renderPool.waitForDone();
@@ -623,6 +624,56 @@ bool Document::pageHasImages(int pageNumber) const
         return false;
     }
     return found;
+}
+
+QVariantList Document::pageImageRects(int pageNumber) const
+{
+    if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
+        return {};
+    QMutexLocker lock(&m_mutex);
+    if (m_imageRectCache.contains(pageNumber))
+        return m_imageRectCache.value(pageNumber);
+
+    std::vector<QRectF> found;
+    fz_stext_page *text = nullptr;
+    fz_try(m_ctx) {
+        const QPointF origin = m_origins.at(pageNumber);
+        const QSizeF size = m_sizes.at(pageNumber);
+        fz_stext_options options{};
+        options.flags = FZ_STEXT_PRESERVE_IMAGES;
+        text = fz_new_stext_page_from_page_number(m_ctx, m_doc, pageNumber, &options);
+        const double pageArea = std::max(1.0, size.width() * size.height());
+        for (fz_stext_block *block = text->first_block; block; block = block->next) {
+            if (block->type != FZ_STEXT_BLOCK_IMAGE)
+                continue;
+            QRectF r(block->bbox.x0 - origin.x(), block->bbox.y0 - origin.y(),
+                     block->bbox.x1 - block->bbox.x0, block->bbox.y1 - block->bbox.y0);
+            // Skip icons, rules and bullets: too small to hold readable text.
+            if (r.width() < 36 || r.height() < 14 || r.width() * r.height() < 0.02 * pageArea)
+                continue;
+            r.adjust(-4, -4, 4, 4);
+            r = r.intersected(QRectF(QPointF(0, 0), size));
+            if (!r.isEmpty())
+                found.push_back(r);
+        }
+    }
+    fz_always(m_ctx) {
+        fz_drop_stext_page(m_ctx, text);
+    }
+    fz_catch(m_ctx) {
+        found.clear();
+    }
+    std::sort(found.begin(), found.end(), [](const QRectF &a, const QRectF &b) {
+        return a.width() * a.height() > b.width() * b.height();
+    });
+    QVariantList rects;
+    for (size_t i = 0; i < found.size() && i < 6; ++i)
+        rects.append(QVariantMap{{QStringLiteral("x"), found[i].x()},
+                                 {QStringLiteral("y"), found[i].y()},
+                                 {QStringLiteral("w"), found[i].width()},
+                                 {QStringLiteral("h"), found[i].height()}});
+    m_imageRectCache.insert(pageNumber, rects);
+    return rects;
 }
 
 QImage Document::renderPage(int page, qreal scale) const

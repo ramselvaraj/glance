@@ -12,6 +12,8 @@ class OcrManager : public QObject {
     Q_OBJECT
     Q_PROPERTY(bool running READ running NOTIFY runningChanged)
     Q_PROPERTY(int progress READ progress NOTIFY progressChanged)
+    // Read on demand (it turns false if the worker dies), not bound.
+    Q_PROPERTY(bool rapidAvailable READ rapidAvailable)
 
 public:
     explicit OcrManager(QObject *parent = nullptr);
@@ -19,9 +21,14 @@ public:
 
     bool running() const { return m_running; }
     int progress() const { return m_progress; }
+    // True when the RapidOCR worker is installed; PDFs are then read with it.
+    bool rapidAvailable() const { return m_workerIsRapid && m_workerAvailable; }
 
+    // For PDFs, `regions` (page-point rects: {x,y,w,h}) limits recognition to
+    // those crops, e.g. the embedded images of a page that already has native
+    // text. Empty = the whole page.
     Q_INVOKABLE void recognize(const QString &path, int page, QSizeF pageSize,
-                               int generation);
+                               int generation, const QVariantList &regions = {});
     Q_INVOKABLE void recognizeRegion(const QString &path, int page, QSizeF pageSize,
                                      QRectF region, int generation);
     Q_INVOKABLE void cancel();
@@ -43,6 +50,10 @@ private:
     void startRecognition();
     void connectWorker();
     void startTesseract();
+    void startPageRender();
+    void startNextJob();
+    void fallbackToTesseract();
+    QString pageCacheKey(const QString &backend, const QString &tag) const;
     void finishWithError(const QString &error);
     void parseTsv();
     bool startWorkerRequest();
@@ -71,6 +82,14 @@ private:
     bool m_isPdf = true;
     bool m_isRegion = false;
     bool m_fallbackPass = false;
+    // RapidOCR on a PDF: one crop (or the whole page) per job, results merged.
+    bool m_rapidMode = false;
+    QVector<QRectF> m_jobs;
+    int m_jobIndex = 0;
+    qreal m_jobOffsetX = 0;
+    qreal m_jobOffsetY = 0;
+    QVariantList m_accum;
+    QString m_regionsTag;
     QRectF m_region;
     qreal m_scaleX = 72.0 / 200.0;
     qreal m_scaleY = 72.0 / 200.0;

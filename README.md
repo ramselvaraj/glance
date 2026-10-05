@@ -76,6 +76,10 @@ same command after updating Glance. To remove the installed files:
 | Ctrl+c | copy selected text, or the current page when nothing is selected |
 | q | quit |
 
+Scanned pages and images embedded in PDFs (screenshots, figures with text) are read
+in the background with RapidOCR as you browse, three pages ahead; native PDF text is
+never re-read. Tesseract is only a fallback if the RapidOCR runtime is missing.
+
 Links in a PDF are clickable (hover tints them); web links open in your browser.
 Glance remembers the page, position, zoom, rotation and page layout for each file.
 Double-click selects the identifier or punctuation run under the pointer, not the

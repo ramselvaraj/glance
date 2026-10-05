@@ -41,6 +41,9 @@ public:
     Q_INVOKABLE QSizeF pageSizePt(int page) const;
     Q_INVOKABLE bool pageHasText(int page) const;
     Q_INVOKABLE bool pageHasImages(int page) const;
+    // Embedded images big enough to hold readable text, as page-point rects
+    // [{x,y,w,h}] (largest first, at most 6, slightly padded). Cached.
+    Q_INVOKABLE QVariantList pageImageRects(int page) const;
 
     // Printed page label ("iv", "40") as defined by the PDF; the plain 1-based
     // number when the document defines none. Thread-safe.
@@ -107,6 +110,7 @@ private:
     fz_stext_page *textPage(int page) const;
     QVariantList loadLinks(int page) const;
     mutable QHash<int, QVariantList> m_linkCache;
+    mutable QHash<int, QVariantList> m_imageRectCache;
     mutable QMutex m_linkMutex;
     void ensureLabels() const;
     mutable QStringList m_labels;
