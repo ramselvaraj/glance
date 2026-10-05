@@ -1317,6 +1317,16 @@ Window {
         height: 40
         color: Theme.darkerBackground
 
+        // Drag the bar to move the window: hand the move to the compositor.
+        // TakeOverForbidden keeps the search field, buttons and page-number
+        // click working; only the bar's own empty space starts a move.
+        DragHandler {
+            target: null
+            acceptedButtons: Qt.LeftButton
+            grabPermissions: PointerHandler.TakeOverForbidden
+            onActiveChanged: if (active) root.startSystemMove()
+        }
+
         RowLayout {
             anchors.fill: parent
             anchors.leftMargin: 14
