@@ -194,6 +194,9 @@ int main(int argc, char *argv[])
         const QVariantList allSearch = doc->searchAll(QStringLiteral("RP2040"));
         fprintf(stderr, "selftest: searchAll 'RP2040' pages=%d\n", int(allSearch.size()));
         const QSizeF size = doc->pageSizePt(0);
+        fprintf(stderr, "selftest: labels page1='%s' page2='%s' page42='%s' find('40')=%d\n",
+                doc->pageLabel(0).toUtf8().constData(), doc->pageLabel(1).toUtf8().constData(),
+                doc->pageLabel(41).toUtf8().constData(), doc->pageForLabel(QStringLiteral("40")));
         fprintf(stderr, "selftest: page0 text=%s images=%s\n",
                 doc->pageHasText(0) ? "yes" : "no",
                 doc->pageHasImages(0) ? "yes" : "no");

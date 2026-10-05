@@ -18,6 +18,10 @@ Window {
     property bool showOutline: false
     property var outlineModel: []
     property bool searchActive: false
+    property bool searchBackward: false
+    property bool cmdActive: false
+    property int vimCount: 0
+    property bool gPending: false
     property string searchText: ""
     property int searchPage: -1
     property var searchBoxes: []
@@ -101,26 +105,24 @@ Window {
         }
     }
 
+    // Page under the 40% line of the viewport. Starts from the current page so
+    // scrolling costs O(pages moved), not O(page count).
     function detectPage() {
-        const t0 = nowMs()
-        const midY = view.contentY + view.height * 0.4
         const n = pageCount
-        let found = false
-        for (let i = 0; i < n; ++i) {
-            const it = pagesCol.children[i]
-            if (!it)
-                continue
-            if (midY < pagesCol.y + it.y + it.height) {
-                currentPage = i + 1
-                found = true
-                break
-            }
+        if (n === 0)
+            return
+        const midY = view.contentY + view.height * 0.4
+        let i = Math.max(0, Math.min(n - 1, currentPage - 1))
+        const bottom = idx => {
+            const it = pagesCol.children[idx]
+            return it ? pagesCol.y + it.y + it.height : Number.MAX_VALUE
         }
-        if (!found)
-            currentPage = n
-        const dt = nowMs() - t0
-        if (dt > 1)
-            console.log("GLANCE detectPage ms=" + dt.toFixed(1))
+        while (i > 0 && midY < bottom(i - 1))
+            --i
+        while (i < n - 1 && midY >= bottom(i))
+            ++i
+        if (currentPage !== i + 1)
+            currentPage = i + 1
     }
 
     function jumpTo(page, animate) {
@@ -264,6 +266,70 @@ Window {
         showOutline = !showOutline
         if (showOutline && outlineModel.length === 0)
             outlineModel = Doc.outline()
+    }
+
+    function takeCount() {
+        const n = Math.max(1, vimCount)
+        vimCount = 0
+        return n
+    }
+
+    function scrollBy(dx, dy) {
+        view.contentY = Math.max(0, Math.min(view.contentY + dy,
+                                             Math.max(0, view.contentHeight - view.height)))
+        view.contentX = Math.max(0, Math.min(view.contentX + dx,
+                                             Math.max(0, view.contentWidth - view.width)))
+    }
+
+    function openSearch(backward) {
+        searchBackward = backward
+        searchActive = true
+        searchField.forceActiveFocus()
+        searchField.selectAll()
+    }
+
+    function openCommand() {
+        cmdActive = true
+        cmdField.text = ""
+        cmdField.forceActiveFocus()
+    }
+
+    function closeCommand() {
+        cmdActive = false
+        cmdField.text = ""
+        view.forceActiveFocus()
+    }
+
+    // Accepts a printed page label ("40", "iv"), a plain page number, or a
+    // relative move (+5 / -3). Printed labels win, so ":40" matches the number
+    // printed on the page and the document's own contents list.
+    function gotoPage(text) {
+        const t = text.trim()
+        if (t === "" || pageCount === 0)
+            return false
+        let target = -1
+        if (/^[+-]\d+$/.test(t)) {
+            target = currentPage - 1 + parseInt(t)
+        } else if (t === "$") {
+            target = pageCount - 1
+        } else {
+            target = Doc.pageForLabel(t)
+            if (target < 0 && /^\d+$/.test(t))
+                target = parseInt(t) - 1
+        }
+        if (target < 0 || target >= pageCount)
+            return false
+        jumpTo(target + 1, false)
+        return true
+    }
+
+    function pageIndicator() {
+        if (pageCount <= 0)
+            return ""
+        const label = Doc.pageLabel(currentPage - 1)
+        const position = currentPage + " / " + pageCount
+        return label !== "" && label !== String(currentPage)
+            ? label + "  ·  " + position : position
     }
 
     function closeSearch() {
@@ -989,11 +1055,17 @@ Window {
                 renderType: Text.QtRendering
             }
             Text {
-                text: pageCount > 0 ? (currentPage + " / " + pageCount) : ""
+                text: root.pageIndicator()
                 color: Theme.foreground
                 opacity: 0.75
                 font.pixelSize: 12
                 renderType: Text.QtRendering
+                MouseArea {
+                    anchors.fill: parent
+                    anchors.margins: -4
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.openCommand()
+                }
             }
             Text {
                 text: Math.round(zoom * 100) + "%"
@@ -1003,6 +1075,44 @@ Window {
                 renderType: Text.QtRendering
             }
             Item { Layout.fillWidth: true }
+
+            TextInput {
+                id: cmdField
+                visible: root.cmdActive
+                Layout.preferredWidth: visible ? 150 : 0
+                Layout.alignment: Qt.AlignVCenter
+                color: Theme.foreground
+                selectionColor: Theme.accent
+                selectedTextColor: Theme.darkerBackground
+                font.pixelSize: 12
+                renderType: Text.QtRendering
+                verticalAlignment: TextInput.AlignVCenter
+                leftPadding: 10
+                clip: true
+                Text {
+                    x: 0
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: ":"
+                    color: Theme.accent
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                Text {
+                    x: 10
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "page (40, iv, +5)"
+                    visible: cmdField.text === ""
+                    color: Theme.mutedForeground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                onAccepted: {
+                    root.gotoPage(text)
+                    root.closeCommand()
+                }
+                Keys.onEscapePressed: root.closeCommand()
+                onVisibleChanged: if (visible) forceActiveFocus()
+            }
 
             TextInput {
                 id: searchField
@@ -1018,7 +1128,7 @@ Window {
                 clip: true
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "search…"
+                    text: root.searchBackward ? "search backward…" : "search…"
                     visible: searchField.text === ""
                     color: Theme.mutedForeground
                     font.pixelSize: 12
@@ -1035,7 +1145,7 @@ Window {
                     root.searchPage = -1
                     root.searchBoxes = []
                 }
-                onAccepted: root.runSearch(true, 1)
+                onAccepted: { root.runSearch(true, root.searchBackward ? -1 : 1); view.forceActiveFocus() }
                 Keys.onEscapePressed: root.closeSearch()
                 onVisibleChanged: if (visible) forceActiveFocus()
             }
@@ -1127,7 +1237,12 @@ Window {
             contentWidth: Math.max(width, colW(zoom))
             contentHeight: pagesCol.implicitHeight
             onContentXChanged: root.refreshViewportSelection()
-            onContentYChanged: root.refreshViewportSelection()
+            onContentYChanged: {
+                root.refreshViewportSelection()
+                root.detectPage()
+            }
+            onHeightChanged: root.detectPage()
+            onContentHeightChanged: root.detectPage()
 
             Column {
                 id: pagesCol
@@ -1560,46 +1675,101 @@ Window {
     // ---------- shortcuts ----------
     // Single-key shortcuts are disabled while the search field has focus so
     // typing doesn't trigger navigation (or quit!).
-    readonly property bool typing: searchField.activeFocus
+    readonly property bool typing: searchField.activeFocus || cmdField.activeFocus
 
     Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
     Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
                onActivated: root.recognizeCurrentPage() }
     Shortcut { sequence: "Escape"; onActivated: {
-        if (root.searchActive)
+        root.vimCount = 0
+        root.gPending = false
+        if (root.cmdActive)
+            root.closeCommand()
+        else if (root.searchActive)
             root.closeSearch()
         else
             root.clearSelection()
     } }
     Shortcut { sequence: "q"; enabled: !root.typing; onActivated: Qt.quit() }
-    Shortcut { sequence: "Ctrl+f"; onActivated: {
-        root.searchActive = true
-        searchField.forceActiveFocus()
-        searchField.selectAll()
-    } }
+    Shortcut { sequence: "Ctrl+f"; onActivated: root.openSearch(false) }
+
+    // vim-style navigation: counts, motions, / ? : and n N.
+    Shortcut { sequence: "/"; enabled: !root.typing; onActivated: root.openSearch(false) }
+    Shortcut { sequence: "?"; enabled: !root.typing; onActivated: root.openSearch(true) }
+    Shortcut { sequence: ":"; enabled: !root.typing; onActivated: root.openCommand() }
+    Shortcut { sequence: "Ctrl+g"; onActivated: root.openCommand() }
     Shortcut { sequence: "n"; enabled: root.searchActive && !root.typing;
-               onActivated: root.runSearch(false, 1) }
+               onActivated: root.runSearch(false, root.searchBackward ? -1 : 1) }
     Shortcut { sequence: "Shift+n"; enabled: root.searchActive && !root.typing;
-               onActivated: root.runSearch(false, -1) }
+               onActivated: root.runSearch(false, root.searchBackward ? 1 : -1) }
+    Shortcut { sequence: "j"; enabled: !root.typing
+               onActivated: root.scrollBy(0, 80 * root.takeCount()) }
+    Shortcut { sequence: "k"; enabled: !root.typing
+               onActivated: root.scrollBy(0, -80 * root.takeCount()) }
+    Shortcut { sequence: "h"; enabled: !root.typing
+               onActivated: root.scrollBy(-80 * root.takeCount(), 0) }
+    Shortcut { sequence: "l"; enabled: !root.typing
+               onActivated: root.scrollBy(80 * root.takeCount(), 0) }
+    Shortcut { sequence: "J"; enabled: !root.typing
+               onActivated: root.jumpTo(root.currentPage + root.takeCount(), false) }
+    Shortcut { sequence: "K"; enabled: !root.typing
+               onActivated: root.jumpTo(Math.max(1, root.currentPage - root.takeCount()), false) }
+    Shortcut { sequence: "d"; enabled: !root.typing
+               onActivated: root.scrollBy(0, view.height / 2 * root.takeCount()) }
+    Shortcut { sequence: "u"; enabled: !root.typing
+               onActivated: root.scrollBy(0, -view.height / 2 * root.takeCount()) }
+    Shortcut { sequence: "Ctrl+d"; enabled: !root.typing
+               onActivated: root.scrollBy(0, view.height / 2 * root.takeCount()) }
+    Shortcut { sequence: "Ctrl+u"; enabled: !root.typing
+               onActivated: root.scrollBy(0, -view.height / 2 * root.takeCount()) }
+    Shortcut { sequence: "PgDown"; enabled: !root.typing
+               onActivated: root.scrollBy(0, view.height * 0.9 * root.takeCount()) }
+    Shortcut { sequence: "PgUp"; enabled: !root.typing
+               onActivated: root.scrollBy(0, -view.height * 0.9 * root.takeCount()) }
+    // gg = top; NG / :N = page N (printed label first); G alone = last page.
+    Shortcut { sequence: "g"; enabled: !root.typing; onActivated: {
+        if (root.gPending) {
+            root.gPending = false
+            if (root.vimCount > 0)
+                root.gotoPage(String(root.takeCount()))
+            else
+                root.jumpTo(1, false)
+        } else {
+            root.gPending = true
+            gPendingTimer.restart()
+        }
+    } }
+    Shortcut { sequence: "G"; enabled: !root.typing; onActivated: {
+        if (root.vimCount > 0)
+            root.gotoPage(String(root.takeCount()))
+        else
+            root.jumpTo(root.pageCount, false)
+    } }
+    Timer { id: gPendingTimer; interval: 800; onTriggered: root.gPending = false }
+    Item {
+        visible: false
+        Repeater {
+            model: 10
+            delegate: Item {
+                Shortcut {
+                    sequence: String(index)
+                    enabled: !root.typing && (index > 0 || root.vimCount > 0)
+                    onActivated: root.vimCount = Math.min(99999, root.vimCount * 10 + index)
+                }
+            }
+        }
+    }
+
     Shortcut { sequence: "T"; enabled: !root.typing; onActivated: root.toggleOutline() }
     Shortcut { sequence: "c"; enabled: !root.typing; onActivated: root.copyPage() }
     Shortcut { sequence: "f"; enabled: !root.typing; onActivated: root.toggleFullscreen() }
     Shortcut { sequence: "F11"; onActivated: root.toggleFullscreen() }
-    Shortcut { sequence: "j"; enabled: !root.typing; onActivated: root.jumpTo(root.currentPage + 1, false) }
-    Shortcut { sequence: "k"; enabled: !root.typing; onActivated: root.jumpTo(root.currentPage - 1, false) }
-    Shortcut { sequence: "d"; enabled: !root.typing; onActivated: view.contentY = Math.min(
-                  view.contentY + view.height / 2,
-                  Math.max(0, view.contentHeight - view.height)) }
-    Shortcut { sequence: "u"; enabled: !root.typing; onActivated: view.contentY = Math.max(0,
-                  view.contentY - view.height / 2) }
-    Shortcut { sequence: "g"; enabled: !root.typing; onActivated: root.jumpTo(1, false) }
-    Shortcut { sequence: "G"; enabled: !root.typing; onActivated: root.jumpTo(root.pageCount, false) }
     Shortcut { sequence: "="; enabled: !root.typing; onActivated: root.zoomAt(view.width / 2, view.height / 2, 1.25) }
     Shortcut { sequence: "-"; enabled: !root.typing; onActivated: root.zoomAt(view.width / 2, view.height / 2, 0.8) }
     Shortcut { sequence: "w"; enabled: !root.typing; onActivated: root.fitWidth() }
     Shortcut { sequence: "p"; enabled: !root.typing; onActivated: root.fitPage() }
-    Shortcut { sequence: "1"; enabled: !root.typing; onActivated: root.zoom = 1.0 }
+    Shortcut { sequence: "Ctrl+0"; onActivated: root.zoom = 1.0 }
     Shortcut { sequence: "r"; enabled: !root.typing; onActivated: root.rotateCW() }
     Shortcut { sequence: "t"; enabled: !root.typing; onActivated: root.showThumbs = !root.showThumbs }
     Shortcut { sequence: "o"; enabled: !root.typing; onActivated: picker.open() }

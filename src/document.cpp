@@ -217,6 +217,8 @@ Document::~Document()
 
 void Document::reset()
 {
+    m_labels.clear();
+    m_labelsBuilt = false;
     cancelSearch();
     m_textPool.waitForDone();
     m_renderPool.waitForDone();
@@ -338,6 +340,52 @@ bool Document::pageHasText(int pageNumber) const
         return false;
     }
     return false;
+}
+
+void Document::ensureLabels() const
+{
+    QMutexLocker lock(&m_mutex);
+    if (m_labelsBuilt)
+        return;
+    m_labelsBuilt = true;
+    m_labels.reserve(m_pageCount);
+    for (int i = 0; i < m_pageCount; ++i) {
+        QString label = QString::number(i + 1);
+        fz_page *page = nullptr;
+        fz_try(m_ctx) {
+            page = fz_load_page(m_ctx, m_doc, i);
+            char buf[64] = {0};
+            fz_page_label(m_ctx, page, buf, sizeof buf);
+            if (buf[0])
+                label = QString::fromUtf8(buf);
+        }
+        fz_always(m_ctx) {
+            fz_drop_page(m_ctx, page);
+        }
+        fz_catch(m_ctx) {
+        }
+        m_labels.append(label);
+    }
+}
+
+QString Document::pageLabel(int page) const
+{
+    if (!isOpen() || page < 0 || page >= m_pageCount)
+        return QString();
+    ensureLabels();
+    return m_labels.value(page);
+}
+
+int Document::pageForLabel(const QString &label) const
+{
+    if (!isOpen())
+        return -1;
+    ensureLabels();
+    const QString wanted = label.trimmed();
+    for (int i = 0; i < m_labels.size(); ++i)
+        if (m_labels.at(i).compare(wanted, Qt::CaseInsensitive) == 0)
+            return i;
+    return -1;
 }
 
 bool Document::pageHasImages(int pageNumber) const

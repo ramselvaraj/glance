@@ -57,11 +57,15 @@ same command after updating Glance. To remove the installed files:
 
 | Key | Action |
 |-----|--------|
-| j/k | next/prev page |
-| d/u | half page down/up |
-| g/G | first/last page |
+| j/k, h/l | scroll down/up, left/right (count prefix: `5j`) |
+| J/K | next/prev page (`3J`) |
+| d/u, Ctrl+d/u | half page down/up |
+| gg / G | first / last page |
+| `40G`, `:40` | go to page 40: the printed page number if the PDF has page labels, else the PDF page; `:iv`, `:+5`, `:$` also work |
+| / and ? | search forward / backward (Ctrl+f also searches); n/N next/previous match |
+| click the page number | same as `:` |
 | +/− | zoom |
-| w/p/1 | fit width / fit page / 100% |
+| w/p/Ctrl+0 | fit width / fit page / 100% |
 | r | rotate 90° |
 | t | thumbnails |
 | f / F11 | fullscreen |

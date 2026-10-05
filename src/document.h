@@ -42,6 +42,12 @@ public:
     Q_INVOKABLE bool pageHasText(int page) const;
     Q_INVOKABLE bool pageHasImages(int page) const;
 
+    // Printed page label ("iv", "40") as defined by the PDF; the plain 1-based
+    // number when the document defines none. Thread-safe.
+    Q_INVOKABLE QString pageLabel(int page) const;
+    // 0-based page whose label equals `label` (case-insensitive), or -1.
+    Q_INVOKABLE int pageForLabel(const QString &label) const;
+
     // Renders page at 1.0 = natural PDF size (one point per pixel); callers
     // factor in devicePixelRatio. Thread-safe, serialized.
     QImage renderPage(int page, qreal scale) const;
@@ -84,6 +90,9 @@ private:
     bool load(const QString &path);
     void computeSizes();
     fz_stext_page *textPage(int page) const;
+    void ensureLabels() const;
+    mutable QStringList m_labels;
+    mutable bool m_labelsBuilt = false;
     QVariantMap selectTextStream(int page, QPointF anchor, QPointF focus) const;
     bool pageTextEndpoints(int page, QPointF &first, QPointF &last) const;
 
