@@ -12,8 +12,10 @@ Item {
     property real dpr: Screen.devicePixelRatio
 
     readonly property bool sideways: (rotationAngle === 90 || rotationAngle === 270)
+    // Round UP so the texture is never smaller than what is displayed; a
+    // bucket below the display scale is what makes pages look soft.
     readonly property int bucketExp: Math.max(-3, Math.min(10,
-        Math.round(Math.log(Math.max(zoom, 0.2)) / Math.log(1.25))))
+        Math.ceil(Math.log(Math.max(zoom, 0.2)) / Math.log(1.25) - 1e-6)))
     property int renderedExp: 2
     property bool ready: false
 
@@ -40,18 +42,17 @@ Item {
 
     function maybeUpgrade() {
         const target = bucketExp
-        if (target === renderedExp) {
+        // Too small -> re-render immediately. Too large (over ~1.5x) -> shrink
+        // to save memory; between the two keep the existing texture.
+        if (target === renderedExp || (target < renderedExp && renderedExp - target < 2)) {
             pendingExp = -1
             return
         }
-        const ratio = zoom / Math.pow(1.25, renderedExp)
-        if (ratio > 1.3 || ratio < 1.0 / 1.3) {
-            if (sharp.status === Image.Loading) {
-                pendingExp = target
-            } else {
-                renderedExp = target
-                pendingExp = -1
-            }
+        if (sharp.status === Image.Loading) {
+            pendingExp = target
+        } else {
+            renderedExp = target
+            pendingExp = -1
         }
     }
 
@@ -167,5 +168,6 @@ Item {
         darkerEdge = Theme.darkerBackground
         renderedExp = bucketExp
         ready = true
+        maybeUpgrade()
     }
 }
