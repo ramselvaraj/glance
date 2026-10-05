@@ -3,13 +3,14 @@
 #include <QDir>
 #include <QFile>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QDebug>
 
 Theme::Theme(QObject *parent)
     : QObject(parent)
 {
     m_reloadDebounce.setSingleShot(true);
-    m_reloadDebounce.setInterval(200);
+    m_reloadDebounce.setInterval(300);
     connect(&m_reloadDebounce, &QTimer::timeout, this, &Theme::reload);
 
     connect(&m_watcher, &QFileSystemWatcher::fileChanged,
@@ -20,9 +21,26 @@ Theme::Theme(QObject *parent)
     reload();
 }
 
+// Omarchy stages the active theme under $XDG_STATE_HOME/omarchy/current and
+// swaps that whole directory on every theme change.
+static QString omarchyCurrentDir()
+{
+    const QString state = QProcessEnvironment::systemEnvironment()
+        .value(QStringLiteral("XDG_STATE_HOME"),
+               QDir::homePath() + QStringLiteral("/.local/state"));
+    return state + QStringLiteral("/omarchy/current");
+}
+
 void Theme::resolveThemeDir(QString *outDir)
 {
     outDir->clear();
+
+    // Preferred: the staged copy of whatever theme is active right now.
+    const QString staged = omarchyCurrentDir() + QStringLiteral("/theme");
+    if (QFile::exists(staged + QStringLiteral("/colors.toml"))) {
+        *outDir = staged;
+        return;
+    }
 
     QProcess current;
     current.start(QStringLiteral("omarchy"),
@@ -165,18 +183,25 @@ void Theme::reload()
     parseColorsToml(toml, &p);
     adopt(p);
 
-    // Re-point watchers at whatever is active now.
+    // Re-point watchers at whatever is active now. A theme switch replaces the
+    // staged `theme` directory and rewrites `theme.name`, so watch the `current`
+    // directory (catches the swap), the staged theme directory, and both files.
     m_currentToml = toml;
     if (!m_watcher.files().isEmpty())
         m_watcher.removePaths(m_watcher.files());
-    m_watcher.addPath(toml);
-
-    QStringList dirs = m_watcher.directories();
-    for (const QString &d :
-         {QStringLiteral("/usr/share/omarchy/themes"),
-          QDir::homePath() + QStringLiteral("/.config/omarchy/themes")}) {
-        if (!dirs.contains(d) && QFile::exists(d))
-            m_watcher.addPath(d);
+    if (!m_watcher.directories().isEmpty())
+        m_watcher.removePaths(m_watcher.directories());
+    const QString current = omarchyCurrentDir();
+    const QStringList watched{
+        toml,
+        current + QStringLiteral("/theme.name"),
+        current,
+        current + QStringLiteral("/theme"),
+        QStringLiteral("/usr/share/omarchy/themes"),
+        QDir::homePath() + QStringLiteral("/.config/omarchy/themes")};
+    for (const QString &path : watched) {
+        if (QFile::exists(path))
+            m_watcher.addPath(path);
     }
 }
 
