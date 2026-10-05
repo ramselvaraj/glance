@@ -48,6 +48,10 @@ Window {
     property int ocrGeneration: 0
     property var ocrPages: ({})
     property string ocrStatus: ""
+    // A standalone image is recognised whole, once, as soon as it opens (like
+    // Live Text); regional hover OCR is only for scanned regions inside PDFs.
+    readonly property bool isImageDoc: Doc.filePath !== ""
+        && !Doc.filePath.toLowerCase().endsWith(".pdf")
     property int ocrRequestedPage: -1
     property bool ocrExplicit: false
     property var ocrRegionKeys: ({})
@@ -615,6 +619,26 @@ Window {
             console.log("glance: page copied to clipboard")
     }
 
+    // Select every recognised/native text run on the current page.
+    function selectAllOnPage() {
+        if (pageCount === 0)
+            return
+        const page = Math.max(0, currentPage - 1)
+        const size = Doc.pageSizePt(page)
+        const native = Doc.selectText(page, Qt.point(0, 0), Qt.point(size.width, size.height))
+        const pages = {}
+        if (ocrPages[page] && (!ocrPages[page].embeddedText || native.text === "")) {
+            const words = sortedOcrWords(page)
+            pages[page] = words
+            selectionPages = pages
+            selectionText = ocrText(words)
+        } else {
+            pages[page] = native.boxes
+            selectionPages = pages
+            selectionText = native.text
+        }
+    }
+
     function clearSelection() {
         selectionPages = ({})
         selectionText = ""
@@ -1006,7 +1030,7 @@ Window {
     }
 
     function requestRegionalOcr(selection) {
-        if (!selection)
+        if (!selection || isImageDoc)
             return false
         const hasNativeText = pageTextCapabilities[selection.page] === true
         if (hasNativeText && nativePointHasText(selection.page, selection.point))
@@ -1928,6 +1952,7 @@ Window {
 
     Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
     Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
+    Shortcut { sequence: "Ctrl+a"; enabled: !root.typing; onActivated: root.selectAllOnPage() }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
                onActivated: root.recognizeCurrentPage() }
     Shortcut { sequence: "Escape"; onActivated: {
@@ -2097,6 +2122,9 @@ Window {
     Component.onCompleted: {
         computeSizes()
         pageLayoutReadyTimer.start()
+        if (isImageDoc)
+            Ocr.prewarm()
+        scheduleVisibleOcr()
         if (Qt.application.arguments.indexOf("--perf") !== -1)
             perfStart.start()
     }
@@ -2114,6 +2142,8 @@ Window {
         computeSizes()
         pageLayoutReadyTimer.restart()
         prefetchAround()
+        if (isImageDoc)
+            Ocr.prewarm()
         scheduleVisibleOcr()
     }
 
