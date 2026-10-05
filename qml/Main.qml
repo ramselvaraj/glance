@@ -1049,9 +1049,14 @@ Window {
         id: nearbyOcrTimer
         interval: 800
         onTriggered: {
+            // Read-ahead: the next few pages first (people mostly read forward),
+            // then the previous one. Pages already done or without images are
+            // skipped by requestOcr, so this walks on to the next candidate.
             const page = Math.max(0, root.currentPage - 1)
-            if (!root.requestOcr(page + 1, false))
-                root.requestOcr(page - 1, false)
+            for (const offset of [1, 2, 3, -1]) {
+                if (root.requestOcr(page + offset, false))
+                    break
+            }
         }
     }
 
