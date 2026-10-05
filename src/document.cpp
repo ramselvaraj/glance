@@ -109,6 +109,57 @@ void takeChars(fz_stext_line *line, int from, int to, QString &text, QVariantLis
                                  {QStringLiteral("h"), y1 - y0}});
 }
 
+// Double-click word: the identifier/punctuation run under the point, so code
+// like "keras.layers.Input((128," selects "Input" rather than the whole chunk.
+bool selectWordRun(fz_stext_page *page, fz_point q, const fz_rect &bounds, QString &text,
+                   QVariantList &boxes)
+{
+    const std::vector<SelLine> lines = horizontalLines(page);
+    const int li = closestLine(lines, q);
+    if (li < 0)
+        return false;
+    fz_stext_line *line = lines[li].line;
+    const fz_rect &b = lines[li].box;
+    // Only when the pointer is actually on the line; otherwise let MuPDF snap.
+    if (q.x < b.x0 - 4 || q.x > b.x1 + 4 || std::abs(q.y - lines[li].midY) > (b.y1 - b.y0))
+        return false;
+    std::vector<fz_stext_char *> chars;
+    for (fz_stext_char *ch = line->first_char; ch; ch = ch->next)
+        chars.push_back(ch);
+    if (chars.empty())
+        return false;
+    int hit = 0;
+    float best = 1e30f;
+    for (int i = 0; i < int(chars.size()); ++i) {
+        const float l = chars[i]->quad.ll.x, r = chars[i]->quad.lr.x;
+        const float dx = q.x < l ? l - q.x : (q.x > r ? q.x - r : 0.0f);
+        if (dx < best) { best = dx; hit = i; }
+    }
+    const auto cls = [&](int i) {
+        const auto at = [&](int k) {
+            return QChar(chars[k]->c < 0x10000 ? char16_t(chars[k]->c) : char16_t(0xFFFD));
+        };
+        const QChar c = at(i);
+        const QChar prev = i > 0 ? at(i - 1) : QChar();
+        const QChar next = i + 1 < int(chars.size()) ? at(i + 1) : QChar();
+        if (c.isLetterOrNumber() || c == QLatin1Char('_'))
+            return 1;
+        if ((c == QLatin1Char('\'') || c == QChar(0x2019)) && prev.isLetter() && next.isLetter())
+            return 1;
+        if (c == QLatin1Char('.') && prev.isDigit() && next.isDigit())
+            return 1;
+        return c.isSpace() ? 0 : 2;
+    };
+    const int kind = cls(hit);
+    int from = hit, to = hit;
+    while (from > 0 && cls(from - 1) == kind)
+        --from;
+    while (to + 1 < int(chars.size()) && cls(to + 1) == kind)
+        ++to;
+    takeChars(line, from, to + 1, text, boxes, bounds);
+    return !text.isEmpty();
+}
+
 // Returns false when the endpoints are not in one column (caller falls back to
 // MuPDF's stream-order selection).
 bool selectColumn(fz_stext_page *page, fz_point a, fz_point b, const fz_rect &bounds,
@@ -876,6 +927,15 @@ QVariantMap Document::selectTextAt(int pageNumber, QPointF point,
         fz_stext_page *structuredText = textPage(pageNumber);
         fz_point a = fz_make_point(point.x() + bounds.x0, point.y() + bounds.y0);
         fz_point b = a;
+        if (mode != QStringLiteral("line")) {
+            QString runText;
+            QVariantList runBoxes;
+            if (selectWordRun(structuredText, a, bounds, runText, runBoxes)) {
+                result.insert(QStringLiteral("text"), runText);
+                result.insert(QStringLiteral("boxes"), runBoxes);
+                return result;
+            }
+        }
         const int snapMode = mode == QStringLiteral("line")
             ? FZ_SELECT_LINES : FZ_SELECT_WORDS;
         fz_snap_selection(m_ctx, structuredText, &a, &b, snapMode);

@@ -54,6 +54,10 @@ int main(int argc, char *argv[])
                                      QStringLiteral("Select text between two points: page,x1,y1,x2,y2"),
                                      QStringLiteral("spec"));
     parser.addOption(selectSelfOpt);
+    QCommandLineOption wordSelfOpt(QStringLiteral("word-selftest"),
+                                   QStringLiteral("Double-click word at: page,x,y"),
+                                   QStringLiteral("spec"));
+    parser.addOption(wordSelfOpt);
     parser.addPositionalArgument("file", "Document to open (pdf/images). Optional.");
     parser.process(app);
 
@@ -162,6 +166,18 @@ int main(int argc, char *argv[])
         return app.exec();
     }
 
+    if (parser.isSet(wordSelfOpt)) {
+        const QStringList f = parser.value(wordSelfOpt).split(QLatin1Char(','));
+        if (f.size() != 3 || !doc->isOpen())
+            return 1;
+        const QVariantMap r = doc->selectTextAt(f[0].toInt() - 1,
+            QPointF(f[1].toDouble(), f[2].toDouble()), QStringLiteral("word"));
+        fprintf(stderr, "word-selftest: [%s] boxes=%d\n",
+                r.value("text").toString().toUtf8().constData(),
+                int(r.value("boxes").toList().size()));
+        return 0;
+    }
+
     if (parser.isSet(selectSelfOpt)) {
         const QStringList f = parser.value(selectSelfOpt).split(QLatin1Char(','));
         if (f.size() != 5 || !doc->isOpen())
@@ -233,6 +249,8 @@ int main(int argc, char *argv[])
             const int hitPage = s.value("page").toInt();
             const QVariantMap word = doc->selectTextAt(hitPage, hit, QStringLiteral("word"));
             const QVariantMap line = doc->selectTextAt(hitPage, hit, QStringLiteral("line"));
+            fprintf(stderr, "selftest: point word='%s'\n",
+                    word.value("text").toString().toUtf8().constData());
             fprintf(stderr, "selftest: point word chars=%d line chars=%d\n",
                     int(word.value("text").toString().size()),
                     int(line.value("text").toString().size()));

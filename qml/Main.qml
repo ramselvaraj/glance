@@ -653,6 +653,55 @@ Window {
         return text
     }
 
+    // Double-click granularity: the run of identifier characters (or of
+    // punctuation) under the pointer, not the whole whitespace-separated token.
+    // An apostrophe between letters and a '.' between digits stay inside a word.
+    function charClass(c, prev, next) {
+        if (/[\p{L}\p{N}_]/u.test(c))
+            return 1
+        if ((c === "'" || c === "\u2019") && prev && next
+                && /[\p{L}]/u.test(prev) && /[\p{L}]/u.test(next))
+            return 1
+        if (c === "." && prev && next && /\d/.test(prev) && /\d/.test(next))
+            return 1
+        return /\s/.test(c) ? 0 : 2
+    }
+
+    function subWordAt(word, point) {
+        const chars = word.chars || []
+        if (chars.length === 0)
+            return word
+        let hit = 0
+        let best = Number.MAX_VALUE
+        for (let i = 0; i < chars.length; ++i) {
+            const dx = point.x < chars[i].x ? chars[i].x - point.x
+                     : point.x > chars[i].x + chars[i].w ? point.x - chars[i].x - chars[i].w : 0
+            if (dx < best) {
+                best = dx
+                hit = i
+            }
+        }
+        const cls = i => charClass(chars[i].text, i > 0 ? chars[i - 1].text : "",
+                                   i < chars.length - 1 ? chars[i + 1].text : "")
+        const kind = cls(hit)
+        let from = hit
+        let to = hit
+        while (from > 0 && cls(from - 1) === kind)
+            --from
+        while (to < chars.length - 1 && cls(to + 1) === kind)
+            ++to
+        if (from === 0 && to === chars.length - 1)
+            return word
+        const run = chars.slice(from, to + 1)
+        const left = Math.min(...run.map(c => c.x))
+        const top = Math.min(...run.map(c => c.y))
+        const right = Math.max(...run.map(c => c.x + c.w))
+        const bottom = Math.max(...run.map(c => c.y + c.h))
+        return { text: run.map(c => c.text).join(""), x: left, y: top, w: right - left,
+                 h: bottom - top, block: word.block, paragraph: word.paragraph,
+                 line: word.line, word: word.word, chars: run }
+    }
+
     function selectAt(page, point, mode) {
         if (ocrPages[page]) {
             const words = sortedOcrWords(page)
@@ -670,7 +719,7 @@ Window {
                     const target = words[hit]
                     return center >= target.y && center <= target.y + target.h
                 })
-                    : [words[hit]]
+                    : [subWordAt(words[hit], point)]
                 const pages = {}
                 pages[page] = chosen
                 selectionPages = pages
