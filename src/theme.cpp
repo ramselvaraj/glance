@@ -35,6 +35,10 @@ void Theme::resolveThemeDir(QString *outDir)
             // (exact case), then user + stock dirs (case-insensitive; user
             // themes are lowercased on disk but reported cased).
             const QString home = QDir::homePath();
+            // On-disk dir names are lowercase and hyphenated ("City From
+            // Above Warm" -> "city-from-above-warm").
+            const QString slug = themeName.toLower().simplified()
+                                     .replace(QLatin1Char(' '), QLatin1Char('-'));
             QList<QString> dirs;
             QProcess dir;
             dir.start(QStringLiteral("omarchy"),
@@ -45,10 +49,8 @@ void Theme::resolveThemeDir(QString *outDir)
                 if (!out.isEmpty())
                     dirs.append(out);
             }
-            dirs << home + QStringLiteral("/.config/omarchy/themes/")
-                          + themeName.toLower()
-                 << QStringLiteral("/usr/share/omarchy/themes/")
-                          + themeName.toLower();
+            dirs << home + QStringLiteral("/.config/omarchy/themes/") + slug
+                 << QStringLiteral("/usr/share/omarchy/themes/") + slug;
 
             for (const QString &d : dirs) {
                 if (!d.isEmpty() && QFile::exists(d + QStringLiteral("/colors.toml"))) {
@@ -110,11 +112,14 @@ void Theme::parseColorsToml(const QString &path, Palette *out)
             out->accent = QColor(value);
         } else if (key == QStringLiteral("background")) {
             out->background = QColor(value);
-        } else if (key == QStringLiteral("dark_background")) {
+        } else if (key == QStringLiteral("dark_background") ||
+            key == QStringLiteral("dark_bg")) {
             out->darkBackground = QColor(value);
-        } else if (key == QStringLiteral("darker_background")) {
+        } else if (key == QStringLiteral("darker_background") ||
+            key == QStringLiteral("darker_bg")) {
             out->darkerBackground = QColor(value);
-        } else if (key == QStringLiteral("lighter_background")) {
+        } else if (key == QStringLiteral("lighter_background") ||
+            key == QStringLiteral("lighter_bg")) {
             out->lighterBackground = QColor(value);
         } else if (key == QStringLiteral("foreground") ||
                    key == QStringLiteral("bright_foreground")) {
