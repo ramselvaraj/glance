@@ -116,17 +116,33 @@ bool selectColumn(fz_stext_page *page, fz_point a, fz_point b, const fz_rect &bo
         return false;
     const fz_rect &ra = lines[ia].box;
     const fz_rect &rb = lines[ib].box;
-    float bandX0 = std::min(ra.x0, rb.x0), bandX1 = std::max(ra.x1, rb.x1);
-    if (std::min(ra.x1, rb.x1) <= std::max(ra.x0, rb.x0)) {
-        // Different columns. Two wide lines side by side is multi-column prose,
-        // where stream order is the right reading order. Anything else (table
-        // cells, headers/footers) is selected in visual order; stream order
-        // would otherwise wrap through the header/footer stored at its end.
-        const float wide = 0.3f * (bounds.x1 - bounds.x0);
-        if ((ra.x1 - ra.x0) > wide && (rb.x1 - rb.x0) > wide)
+    // Multi-column prose: several wide lines with another wide line beside them.
+    const float wide = 0.3f * (bounds.x1 - bounds.x0);
+    int sideBySide = 0;
+    for (size_t i = 0; i < lines.size() && sideBySide < 4; ++i) {
+        const fz_rect &p = lines[i].box;
+        if (p.x1 - p.x0 <= wide)
+            continue;
+        for (size_t j = i + 1; j < lines.size(); ++j) {
+            const fz_rect &q = lines[j].box;
+            if (q.x1 - q.x0 > wide && std::abs(lines[i].midY - lines[j].midY) < 3
+                    && (p.x1 <= q.x0 || q.x1 <= p.x0)) {
+                ++sideBySide;
+                break;
+            }
+        }
+    }
+    const bool multiColumn = sideBySide >= 4;
+
+    // Single-flow pages (including tables) are selected in plain visual order.
+    // Only multi-column pages need the column band, so a drag in one column
+    // doesn't pull in the other; cross-column drags use MuPDF's stream order.
+    float bandX0 = -1e30f, bandX1 = 1e30f;
+    if (multiColumn) {
+        if (std::min(ra.x1, rb.x1) <= std::max(ra.x0, rb.x0))
             return false;
-        bandX0 = -1e30f;
-        bandX1 = 1e30f;
+        bandX0 = std::min(ra.x0, rb.x0);
+        bandX1 = std::max(ra.x1, rb.x1);
     }
 
     const auto before = [&](int i, int j) {
