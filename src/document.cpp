@@ -5,7 +5,10 @@
 #include <QCryptographicHash>
 #include <QDateTime>
 #include <QDesktopServices>
+#include <QDir>
 #include <QGuiApplication>
+#include <QImageReader>
+#include <QStandardPaths>
 #include <QUrl>
 #include <QSettings>
 #include <QClipboard>
@@ -298,6 +301,7 @@ void Document::reset()
         m_ctx = nullptr;
     }
     m_path.clear();
+    m_openPath.clear();
 }
 
 bool Document::open(const QString &path)
@@ -313,6 +317,40 @@ bool Document::open(const QString &path)
 QString Document::fileName() const
 {
     return QFileInfo(m_path).fileName();
+}
+
+namespace {
+// Formats MuPDF cannot decode but Qt's image plugins can (WebP, ICO, TGA...) are
+// converted once to a PNG in the cache, keyed by the original file so OCR
+// results cached against the PNG stay valid between sessions.
+QString convertWithQt(const QString &path)
+{
+    QImageReader reader(path);
+    reader.setAutoTransform(true);
+    if (!reader.canRead())
+        return {};
+    const QFileInfo info(path);
+    const QString key = QString::fromLatin1(QCryptographicHash::hash(
+        QStringLiteral("%1|%2|%3").arg(info.canonicalFilePath()).arg(info.size())
+            .arg(info.lastModified().toMSecsSinceEpoch()).toUtf8(),
+        QCryptographicHash::Sha1).toHex());
+    const QString dirPath = QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
+        + QStringLiteral("/converted");
+    QDir dir(dirPath);
+    if (!dir.mkpath(QStringLiteral(".")))
+        return {};
+    const QString out = dir.filePath(key + QStringLiteral(".png"));
+    if (!QFileInfo::exists(out)) {
+        const QImage image = reader.read();   // first frame of an animation
+        if (image.isNull() || !image.save(out, "PNG"))
+            return {};
+        // Keep the cache small: drop the oldest conversions beyond 40.
+        QFileInfoList files = dir.entryInfoList({QStringLiteral("*.png")}, QDir::Files, QDir::Time);
+        for (int i = 40; i < files.size(); ++i)
+            QFile::remove(files.at(i).absoluteFilePath());
+    }
+    return out;
+}
 }
 
 bool Document::load(const QString &path)
@@ -336,9 +374,29 @@ bool Document::load(const QString &path)
         return false;
     }
 
+    m_openPath.clear();
+    bool opened = false;
     fz_try(m_ctx)
         m_doc = fz_open_document(m_ctx, path.toUtf8().constData());
-    fz_catch(m_ctx) {
+    fz_catch(m_ctx)
+        opened = false;
+    if (m_doc)
+        opened = true;
+    if (!opened) {
+        // MuPDF could not read it; try Qt's image plugins (WebP, ICO, TGA...).
+        const QString converted = convertWithQt(path);
+        if (!converted.isEmpty()) {
+            fz_try(m_ctx)
+                m_doc = fz_open_document(m_ctx, converted.toUtf8().constData());
+            fz_catch(m_ctx)
+                m_doc = nullptr;
+            if (m_doc) {
+                m_openPath = converted;
+                opened = true;
+            }
+        }
+    }
+    if (!opened) {
         qWarning() << "glance: cannot open" << path;
         fz_drop_context(m_ctx);
         m_ctx = nullptr;

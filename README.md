@@ -80,6 +80,10 @@ Scanned pages and images embedded in PDFs (screenshots, figures with text) are r
 in the background with RapidOCR as you browse, three pages ahead; native PDF text is
 never re-read. Tesseract is only a fallback if the RapidOCR runtime is missing.
 
+Supported files: PDF, PNG, JPEG, GIF, BMP, TIFF, PNM, JPEG 2000, SVG, EPUB, HTML,
+plain text and CBZ open directly. WebP, ICO and TGA are converted to a cached PNG
+on open (Qt decodes them), so they behave like any other image, including OCR.
+
 Links in a PDF are clickable (hover tints them); web links open in your browser.
 Glance remembers the page, position, zoom, rotation and page layout for each file.
 Double-click selects the identifier or punctuation run under the pointer, not the

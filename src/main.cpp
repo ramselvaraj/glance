@@ -123,7 +123,7 @@ int main(int argc, char *argv[])
         auto *pass = new int(0);
         timer->start();
         QObject::connect(&ocr, &OcrManager::finished, &app,
-                         [&app, &ocr, doc, filePath, ocrPage, ocrRegions, cancelTest, timer, pass](int generation, int page, const QString &text,
+                         [&app, &ocr, doc, ocrPage, ocrRegions, cancelTest, timer, pass](int generation, int page, const QString &text,
                                  const QVariantList &words, const QString &error) {
             if (cancelTest && generation != 2)
                 return;
@@ -154,7 +154,7 @@ int main(int argc, char *argv[])
             }
             if (!cancelTest && (*pass)++ == 0) {
                 timer->restart();
-                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
+                ocr.recognize(doc->ocrPath(), ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
                 return;
             }
             app.exit(0);
@@ -163,12 +163,12 @@ int main(int argc, char *argv[])
             ocr.cancel();
             app.exit(3);
         });
-        ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 1, ocrRegions);
+        ocr.recognize(doc->ocrPath(), ocrPage, doc->pageSizePt(ocrPage), 1, ocrRegions);
         if (cancelTest) {
-            QTimer::singleShot(25, &app, [&ocr, doc, filePath, ocrPage, ocrRegions, timer] {
+            QTimer::singleShot(25, &app, [&ocr, doc, ocrPage, ocrRegions, timer] {
                 ocr.cancel();
                 timer->restart();
-                ocr.recognize(filePath, ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
+                ocr.recognize(doc->ocrPath(), ocrPage, doc->pageSizePt(ocrPage), 2, ocrRegions);
             });
         }
         return app.exec();

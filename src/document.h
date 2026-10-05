@@ -20,6 +20,9 @@ class Document : public QObject {
     Q_PROPERTY(int pageCount READ pageCount NOTIFY pageCountChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY pageCountChanged)
     Q_PROPERTY(QString filePath READ filePath NOTIFY pageCountChanged)
+    // What is actually opened: the file itself, or a cached PNG made from a
+    // format MuPDF cannot read but Qt can (WebP, ICO, TGA). Use this for OCR.
+    Q_PROPERTY(QString ocrPath READ ocrPath NOTIFY pageCountChanged)
     Q_PROPERTY(bool ok READ ok NOTIFY pageCountChanged)
 
 public:
@@ -30,6 +33,7 @@ public:
     bool ok() const { return m_doc != nullptr; }
     QString fileName() const;
     QString filePath() const { return m_path; }
+    QString ocrPath() const { return m_openPath.isEmpty() ? m_path : m_openPath; }
 
     int pageCount() const { return m_pageCount; }
 
@@ -121,6 +125,7 @@ private:
     fz_context *m_ctx = nullptr;
     fz_document *m_doc = nullptr;
     QString m_path;
+    QString m_openPath;   // converted PNG when the original needed conversion
     int m_pageCount = 0;
     QVector<QSizeF> m_sizes;
     QVector<QPointF> m_origins;

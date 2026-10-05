@@ -998,7 +998,7 @@ Window {
         ocrExplicit = explicit
         if (explicit)
             ocrStatus = "recognizing page " + (page + 1)
-        Ocr.recognize(Doc.filePath, page, size, ocrGeneration, regions)
+        Ocr.recognize(Doc.ocrPath, page, size, ocrGeneration, regions)
         return true
     }
 
@@ -1088,7 +1088,7 @@ Window {
         ocrRegionKeys = keys
         pendingOcrRegion = { page: selection.page, region: region }
         ocrGeneration += 1
-        Ocr.recognizeRegion(Doc.filePath, selection.page, size, region, ocrGeneration)
+        Ocr.recognizeRegion(Doc.ocrPath, selection.page, size, region, ocrGeneration)
         return true
     }
 
