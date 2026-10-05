@@ -7,6 +7,7 @@
 #include <QDebug>
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <vector>
 
@@ -21,6 +22,156 @@ QVariantMap quadBox(const fz_quad &q, const fz_rect &bounds)
             {QStringLiteral("y"), miny - bounds.y0},
             {QStringLiteral("w"), maxx - minx},
             {QStringLiteral("h"), maxy - miny}};
+}
+
+// Geometric same-column selection. MuPDF selects by text-stream index, which in
+// tables and sidebars sweeps in unrelated cells interleaved between the two
+// endpoints. When both endpoints sit in the same column we instead take the
+// lines between them in visual order that overlap that column.
+struct SelLine {
+    fz_stext_line *line;
+    fz_rect box;
+    float midY;
+};
+
+std::vector<SelLine> horizontalLines(fz_stext_page *page)
+{
+    std::vector<SelLine> lines;
+    for (fz_stext_block *block = page->first_block; block; block = block->next) {
+        if (block->type != FZ_STEXT_BLOCK_TEXT)
+            continue;
+        for (fz_stext_line *line = block->u.t.first_line; line; line = line->next) {
+            if (!line->first_char || std::abs(line->dir.y) > 0.1f || line->dir.x <= 0)
+                continue;
+            lines.push_back({line, line->bbox, (line->bbox.y0 + line->bbox.y1) / 2});
+        }
+    }
+    return lines;
+}
+
+int closestLine(const std::vector<SelLine> &lines, fz_point q)
+{
+    int best = -1;
+    float bestV = 1e30f, bestH = 1e30f;
+    for (int i = 0; i < int(lines.size()); ++i) {
+        const fz_rect &b = lines[i].box;
+        const float half = (b.y1 - b.y0) / 2;
+        const float v = std::max(0.0f, std::abs(q.y - lines[i].midY) - half);
+        const float h = q.x < b.x0 ? b.x0 - q.x : (q.x > b.x1 ? q.x - b.x1 : 0.0f);
+        if (v < bestV - 0.01f || (std::abs(v - bestV) <= 0.01f && h < bestH)) {
+            best = i;
+            bestV = v;
+            bestH = h;
+        }
+    }
+    return best;
+}
+
+// Character boundary (0..n) in the line nearest to x.
+int boundaryAt(fz_stext_line *line, float x)
+{
+    int idx = 0, best = 0;
+    float bestD = 1e30f;
+    for (fz_stext_char *ch = line->first_char; ch; ch = ch->next, ++idx) {
+        const float d1 = std::abs(ch->quad.ll.x - x);
+        const float d2 = std::abs(ch->quad.lr.x - x);
+        if (d1 < bestD) { bestD = d1; best = idx; }
+        if (d2 < bestD) { bestD = d2; best = idx + 1; }
+    }
+    return best;
+}
+
+// Selected text and box of chars [from, to) in the line.
+void takeChars(fz_stext_line *line, int from, int to, QString &text, QVariantList &boxes,
+               const fz_rect &bounds)
+{
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    int idx = 0;
+    for (fz_stext_char *ch = line->first_char; ch; ch = ch->next, ++idx) {
+        if (idx < from || idx >= to)
+            continue;
+        text.append(QChar::fromUcs4(ch->c));
+        const fz_quad &q = ch->quad;
+        x0 = std::min({x0, q.ul.x, q.ur.x, q.ll.x, q.lr.x});
+        x1 = std::max({x1, q.ul.x, q.ur.x, q.ll.x, q.lr.x});
+        y0 = std::min({y0, q.ul.y, q.ur.y, q.ll.y, q.lr.y});
+        y1 = std::max({y1, q.ul.y, q.ur.y, q.ll.y, q.lr.y});
+    }
+    if (x1 > x0)
+        boxes.append(QVariantMap{{QStringLiteral("x"), x0 - bounds.x0},
+                                 {QStringLiteral("y"), y0 - bounds.y0},
+                                 {QStringLiteral("w"), x1 - x0},
+                                 {QStringLiteral("h"), y1 - y0}});
+}
+
+// Returns false when the endpoints are not in one column (caller falls back to
+// MuPDF's stream-order selection).
+bool selectColumn(fz_stext_page *page, fz_point a, fz_point b, const fz_rect &bounds,
+                  QString &text, QVariantList &boxes)
+{
+    const std::vector<SelLine> lines = horizontalLines(page);
+    const int ia = closestLine(lines, a);
+    const int ib = closestLine(lines, b);
+    if (ia < 0 || ib < 0)
+        return false;
+    const fz_rect &ra = lines[ia].box;
+    const fz_rect &rb = lines[ib].box;
+    const float bandX0 = std::min(ra.x0, rb.x0), bandX1 = std::max(ra.x1, rb.x1);
+    if (std::min(ra.x1, rb.x1) <= std::max(ra.x0, rb.x0))
+        return false;
+
+    const auto before = [&](int i, int j) {
+        return lines[i].midY < lines[j].midY - 0.5f
+            || (std::abs(lines[i].midY - lines[j].midY) <= 0.5f
+                && lines[i].box.x0 < lines[j].box.x0);
+    };
+    int top = ia, bottom = ib;
+    fz_point pt = a, pb = b;
+    if (ia != ib ? before(ib, ia) : b.x < a.x) {
+        std::swap(top, bottom);
+        std::swap(pt, pb);
+    }
+
+    if (top == bottom) {
+        int s = boundaryAt(lines[top].line, pt.x), e = boundaryAt(lines[top].line, pb.x);
+        if (s > e)
+            std::swap(s, e);
+        takeChars(lines[top].line, s, e, text, boxes, bounds);
+        return true;
+    }
+
+    std::vector<int> order;
+    for (int i = 0; i < int(lines.size()); ++i) {
+        if (i == top || i == bottom)
+            continue;
+        if (before(top, i) && before(i, bottom)
+                && std::min(lines[i].box.x1, bandX1) > std::max(lines[i].box.x0, bandX0))
+            order.push_back(i);
+    }
+    std::sort(order.begin(), order.end(), before);
+
+    const auto count = [](fz_stext_line *l) {
+        int n = 0;
+        for (fz_stext_char *c = l->first_char; c; c = c->next)
+            ++n;
+        return n;
+    };
+    QStringList parts;
+    QString part;
+    takeChars(lines[top].line, boundaryAt(lines[top].line, pt.x), count(lines[top].line),
+              part, boxes, bounds);
+    parts << part;
+    for (int i : order) {
+        part.clear();
+        takeChars(lines[i].line, 0, count(lines[i].line), part, boxes, bounds);
+        parts << part;
+    }
+    part.clear();
+    takeChars(lines[bottom].line, 0, boundaryAt(lines[bottom].line, pb.x), part, boxes, bounds);
+    parts << part;
+    parts.removeAll(QString());
+    text = parts.join(QLatin1Char('\n'));
+    return true;
 }
 
 }
@@ -411,6 +562,39 @@ QVariantMap Document::selectText(int pageNumber, QPointF anchor, QPointF focus) 
                        {QStringLiteral("boxes"), QVariantList()}};
     if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
         return result;
+    {
+        QMutexLocker lock(&m_mutex);
+        QString text;
+        QVariantList boxes;
+        bool done = false;
+        fz_try(m_ctx) {
+            const QPointF origin = m_origins.at(pageNumber);
+            const QSizeF size = m_sizes.at(pageNumber);
+            const fz_rect bounds = fz_make_rect(origin.x(), origin.y(),
+                origin.x() + size.width(), origin.y() + size.height());
+            done = selectColumn(textPage(pageNumber),
+                                fz_make_point(anchor.x() + bounds.x0, anchor.y() + bounds.y0),
+                                fz_make_point(focus.x() + bounds.x0, focus.y() + bounds.y0),
+                                bounds, text, boxes);
+        }
+        fz_catch(m_ctx) {
+            done = false;
+        }
+        if (done) {
+            result.insert(QStringLiteral("text"), text);
+            result.insert(QStringLiteral("boxes"), boxes);
+            return result;
+        }
+    }
+    return selectTextStream(pageNumber, anchor, focus);
+}
+
+QVariantMap Document::selectTextStream(int pageNumber, QPointF anchor, QPointF focus) const
+{
+    QVariantMap result{{QStringLiteral("text"), QString()},
+                       {QStringLiteral("boxes"), QVariantList()}};
+    if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
+        return result;
 
     QMutexLocker lock(&m_mutex);
     fz_stext_page *structuredText = nullptr;
@@ -522,7 +706,8 @@ QVariantMap Document::selectTextRange(int anchorPage, QPointF anchor,
         }
         const QPointF start = page == anchorPage ? anchor : pageFirst;
         const QPointF end = page == focusPage ? focus : pageLast;
-        const QVariantMap selection = selectText(page, start, end);
+        const QVariantMap selection = anchorPage == focusPage
+            ? selectText(page, start, end) : selectTextStream(page, start, end);
         const QString pageText = selection.value(QStringLiteral("text")).toString();
         if (!pageText.isEmpty())
             textParts.append(pageText);

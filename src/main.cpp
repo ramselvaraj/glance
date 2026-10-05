@@ -49,6 +49,10 @@ int main(int argc, char *argv[])
                                         QStringLiteral("Cancel and restart page recognition"),
                                         QStringLiteral("page"), QStringLiteral("1"));
     parser.addOption(ocrCancelSelfOpt);
+    QCommandLineOption selectSelfOpt(QStringLiteral("select-selftest"),
+                                     QStringLiteral("Select text between two points: page,x1,y1,x2,y2"),
+                                     QStringLiteral("spec"));
+    parser.addOption(selectSelfOpt);
     parser.addPositionalArgument("file", "Document to open (pdf/images). Optional.");
     parser.process(app);
 
@@ -155,6 +159,18 @@ int main(int argc, char *argv[])
             });
         }
         return app.exec();
+    }
+
+    if (parser.isSet(selectSelfOpt)) {
+        const QStringList f = parser.value(selectSelfOpt).split(QLatin1Char(','));
+        if (f.size() != 5 || !doc->isOpen())
+            return 1;
+        const QVariantMap r = doc->selectText(f[0].toInt() - 1,
+            QPointF(f[1].toDouble(), f[2].toDouble()), QPointF(f[3].toDouble(), f[4].toDouble()));
+        fprintf(stderr, "select-selftest: boxes=%d text=[%s]\n",
+                int(r.value("boxes").toList().size()),
+                r.value("text").toString().toUtf8().constData());
+        return 0;
     }
 
     if (parser.isSet(selfOpt)) {

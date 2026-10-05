@@ -84,6 +84,7 @@ private:
     bool load(const QString &path);
     void computeSizes();
     fz_stext_page *textPage(int page) const;
+    QVariantMap selectTextStream(int page, QPointF anchor, QPointF focus) const;
     bool pageTextEndpoints(int page, QPointF &first, QPointF &last) const;
 
     fz_context *m_ctx = nullptr;
