@@ -144,6 +144,44 @@ Item {
             }
         }
 
+        // Read aloud: paragraphs that are skipped fade out; the paragraph being
+        // read gets a soft band and the sentence a stronger one.
+        Repeater {
+            model: root.readActive && root.readMode === "doc" ? (root.readSkipBoxes[pg.page] || []) : []
+            delegate: Rectangle {
+                x: modelData.x * pg.zoom - 2
+                y: modelData.y * pg.zoom - 1
+                width: modelData.w * pg.zoom + 4
+                height: modelData.h * pg.zoom + 2
+                color: Theme.darkerBackground
+                opacity: 0.4
+            }
+        }
+        Repeater {
+            model: root.readActive ? (root.readParaBoxes[pg.page] || []) : []
+            delegate: Rectangle {
+                x: modelData.x * pg.zoom - 3
+                y: modelData.y * pg.zoom - 1
+                width: modelData.w * pg.zoom + 6
+                height: modelData.h * pg.zoom + 2
+                radius: 2
+                color: Theme.accent
+                opacity: 0.13
+            }
+        }
+        Repeater {
+            model: root.readActive ? (root.readSentBoxes[pg.page] || []) : []
+            delegate: Rectangle {
+                x: modelData.x * pg.zoom - 1
+                y: modelData.y * pg.zoom - 1
+                width: modelData.w * pg.zoom + 2
+                height: modelData.h * pg.zoom + 2
+                radius: 2
+                color: Theme.accent
+                opacity: 0.4
+            }
+        }
+
         Repeater {
             model: root.selectionBoxesForPage(pg.page)
             delegate: Rectangle {
@@ -174,6 +212,8 @@ Item {
             const viewPoint = view.mapFromItem(pg, eventPoint.position.x,
                                               eventPoint.position.y)
             const point = pg.mapViewPointToPage(viewPoint)
+            if (tapCount === 1 && root.readJumpAt(pg.page, point))
+                return
             if (tapCount === 1)
                 root.clearSelection()
             else if (tapCount === 2)

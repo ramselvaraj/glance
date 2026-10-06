@@ -41,6 +41,34 @@ Window {
     property bool searchPending: false
     property int searchInitialDirection: 1
     property var selectionPages: ({})
+    // Read aloud
+    property bool readActive: false
+    property string readMode: "doc"          // "doc" = read the document, "selection" = read the selected text
+    property bool readAskInstall: false
+    property var readAll: null               // every paragraph in reading order (Doc.readingParagraphs)
+    property var readList: []                // the paragraphs that are spoken
+    property var readSkips: ({ headers: true, footnotes: true, captions: false,
+                               tables: false, references: false, math: true })
+    property var readParaBoxes: ({})         // page -> boxes of the paragraph being read
+    property var readSentBoxes: ({})         // page -> boxes of the sentence being read
+    property var readSkipBoxes: ({})         // page -> boxes of paragraphs that are skipped
+    property var readSkippedList: []         // the skipped paragraphs themselves (click to include)
+    property var readOverrides: ({})         // paragraph key -> "read" | "skip", from the user
+    property bool readFollow: true
+    property double readScrollStamp: 0       // when the reader last scrolled the view itself
+    property bool showSettings: false
+    property bool confirmRemoveModel: false
+    readonly property bool aiOn: Features.ai
+    property bool showVoices: false
+    property bool showLyrics: false          // big scrolling sentence view over the document
+    property var lyricsModel: []
+    property bool showLens: false            // magnifier that follows the word being read
+    property var lensWord: null              // {page, x, y, w, h, lineX, lineW, ...} in page points
+    property var lensBand: ({ x: 0, y: 0, w: 1, h: 1 })
+    property string lensKey: ""
+    property string lensSource: ""
+    property real lensZ: 3.0
+    property string readInstallLog: ""
     property string selectionText: ""
     readonly property bool spaceHeld: Input.spaceHeld && !typing
     property bool pageLayoutReady: false
@@ -641,6 +669,498 @@ Window {
     function setStatus(text) {
         ocrStatus = text
         statusClearTimer.restart()
+    }
+
+
+    // ---------- read aloud ----------
+
+    function readKindSkipped(kind) {
+        switch (kind) {
+        case "header": case "footer": case "pagenum": case "aside": return readSkips.headers
+        case "footnote": return readSkips.footnotes
+        case "caption": return readSkips.captions
+        case "table": return readSkips.tables
+        case "reference": return readSkips.references
+        case "math": return readSkips.math
+        }
+        return false
+    }
+
+    function readPush(map, key, value) {
+        if (!map[key])
+            map[key] = []
+        map[key].push(value)
+    }
+
+    function readKey(p) {
+        return p.page + ":" + Math.round(p.boxes[0].y) + ":" + p.text.slice(0, 16)
+    }
+
+    function readLoadAll() {
+        const all = Doc.readingParagraphs({})
+        for (let i = 0; i < all.length; ++i)
+            all[i].id = i
+        readAll = all
+    }
+
+    // Splits the document's paragraphs into what is spoken and what is skipped.
+    // The user's own include/skip choices win over the classifier.
+    function readRebuildList() {
+        const list = []
+        const skippedList = []
+        const skipped = {}
+        for (const p of readAll) {
+            const choice = readOverrides[readKey(p)]
+            const skip = choice ? choice === "skip" : readKindSkipped(p.kind)
+            if (skip) {
+                skippedList.push(p)
+                for (const b of p.boxes)
+                    readPush(skipped, b.page, b)
+            } else {
+                list.push(p)
+            }
+        }
+        readList = list
+        readSkippedList = skippedList
+        readSkipBoxes = skipped
+    }
+
+    // First spoken paragraph at or after a position (page, y in points).
+    function readIndexAt(page, y) {
+        for (let i = 0; i < readList.length; ++i) {
+            const b = readList[i].boxes[0]
+            if (b.page > page || (b.page === page && b.y >= y - 1))
+                return i
+        }
+        return Math.max(0, readList.length - 1)
+    }
+
+    // The user says a paragraph is (not) worth reading: remember it for this
+    // document and teach the classifier, which re-judges the whole document.
+    function readCorrect(p, read) {
+        const next = read ? p.boxes[0] : (readList[readList.indexOf(p) + 1]
+                                          ? readList[readList.indexOf(p) + 1].boxes[0] : null)
+        const overrides = Object.assign({}, readOverrides)
+        overrides[readKey(p)] = read ? "read" : "skip"
+        readOverrides = overrides
+        // Only free-floating text (margin notes and the like) is the classifier's call.
+        if (p.features && (!read || p.kind === "aside"))
+            Doc.teachReading(p.features, !read)
+        readLoadAll()
+        readRebuildList()
+        if (readList.length === 0) {
+            closeReader()
+            return
+        }
+        const idx = next ? readIndexAt(next.page, next.y) : readList.length - 1
+        readFollow = true
+        Reader.start(readList.map(x => x.text), idx)
+    }
+
+    function readSkipCurrent() {
+        if (!readActive || readMode !== "doc")
+            return
+        const p = readList[Reader.paragraph]
+        if (p)
+            readCorrect(p, false)
+    }
+
+    // First spoken paragraph at or below the top of the viewport.
+    function readStartIndex() {
+        const pos = viewPosition()
+        const size = pageSizes[pos.page]
+        const y0 = pos.offset * (size ? size.height : 792)
+        for (let i = 0; i < readList.length; ++i) {
+            const boxes = readList[i].boxes
+            const last = boxes[boxes.length - 1]
+            if (last.page > pos.page || (last.page === pos.page && last.y + last.h > y0 + 4))
+                return i
+        }
+        return 0
+    }
+
+    function startReading() {
+        if (pageCount === 0)
+            return
+        if (!aiOn) {
+            showSettings = true
+            return
+        }
+        if (!Reader.available) {
+            readActive = true
+            readAskInstall = true
+            return
+        }
+        readAskInstall = false
+        showVoices = false
+        if (selectionText !== "" && !selectAllDoc) {
+            const text = selectionText.replace(/-\n(?=[a-z])/g, "").replace(/\s+/g, " ").trim()
+            if (text === "")
+                return
+            readMode = "selection"
+            readList = [{ text: text, kind: "body", page: 0, boxes: [] }]
+            readSkipBoxes = ({})
+            readActive = true
+            Reader.start([text], 0)
+            return
+        }
+        readMode = "doc"
+        if (readAll === null)
+            readLoadAll()
+        readRebuildList()
+        if (readList.length === 0) {
+            setStatus("no readable text in this document")
+            readActive = false
+            return
+        }
+        readActive = true
+        readFollow = true
+        Reader.start(readList.map(p => p.text), selectAllDoc ? 0 : readStartIndex())
+    }
+
+    function closeReader() {
+        Reader.stop()
+        showLyrics = false
+        showLens = false
+        readActive = false
+        readAskInstall = false
+        showVoices = false
+        readParaBoxes = ({})
+        readSentBoxes = ({})
+        readSkipBoxes = ({})
+        readSkippedList = []
+        readOverrides = ({})
+    }
+
+    function toggleReading() {
+        if (!aiOn) {
+            showSettings = true
+            return
+        }
+        if (!readActive)
+            startReading()
+        else if (Reader.state === 0)
+            startReading()
+        else
+            Reader.toggle()
+    }
+
+    function readToggleSkip(key) {
+        const s = Object.assign({}, readSkips)
+        s[key] = !s[key]
+        readSkips = s
+        if (!readActive || readMode !== "doc" || readAll === null)
+            return
+        const cur = readList[Reader.paragraph]
+        readRebuildList()
+        let idx = 0
+        if (cur)
+            idx = readIndexAt(cur.boxes[0].page, cur.boxes[0].y)
+        if (readList.length === 0) {
+            closeReader()
+            return
+        }
+        Reader.start(readList.map(p => p.text), idx)
+    }
+
+    // A click on a paragraph while reading continues from there.
+    function readJumpAt(page, pt) {
+        if (!readActive || readMode !== "doc")
+            return false
+        for (const p of readSkippedList) {
+            for (const b of p.boxes) {
+                if (b.page === page && pt.x >= b.x - 3 && pt.x <= b.x + b.w + 3
+                        && pt.y >= b.y - 2 && pt.y <= b.y + b.h + 2) {
+                    readCorrect(p, true)
+                    return true
+                }
+            }
+        }
+        for (let i = 0; i < readList.length; ++i) {
+            for (const b of readList[i].boxes) {
+                if (b.page === page && pt.x >= b.x - 3 && pt.x <= b.x + b.w + 3
+                        && pt.y >= b.y - 2 && pt.y <= b.y + b.h + 2) {
+                    readFollow = true
+                    Reader.jumpToParagraph(i)
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    function readUpdateHighlight() {
+        if (!readActive || readMode !== "doc" || Reader.paragraph < 0
+                || Reader.paragraph >= readList.length) {
+            readParaBoxes = ({})
+            readSentBoxes = ({})
+            return
+        }
+        const p = readList[Reader.paragraph]
+        const para = {}
+        for (const b of p.boxes)
+            readPush(para, b.page, b)
+        const ranges = Reader.sentenceRanges(p.text)
+        const r = ranges[Reader.sentence]
+        const sent = {}
+        let first = null
+        if (r) {
+            for (const b of p.boxes) {
+                const s = Math.max(r.start, b.start)
+                const e = Math.min(r.end, b.end)
+                if (e <= s)
+                    continue
+                const len = Math.max(1, b.end - b.start)
+                const piece = { x: b.x + b.w * (s - b.start) / len, y: b.y,
+                                w: b.w * (e - s) / len, h: b.h }
+                readPush(sent, b.page, piece)
+                if (first === null)
+                    first = { page: b.page, y: b.y }
+            }
+        }
+        readParaBoxes = para
+        readSentBoxes = sent
+        if (readFollow && first !== null)
+            readScrollTo(first.page, first.y)
+    }
+
+    function readScrollTo(page, boxY) {
+        const y = pageTopAt(page, zoom) + (rotation === 0 ? boxY * zoom : 0)
+        const top = view.contentY
+        const h = view.height
+        if (y > top + h * 0.1 && y < top + h * 0.65)
+            return
+        const maxY = Math.max(0, view.contentHeight - h)
+        const target = Math.max(0, Math.min(y - h * 0.22, maxY))
+        if (Math.abs(target - view.contentY) < 2)
+            return
+        readScrollStamp = Date.now()
+        readScrollAnim.stop()
+        readScrollAnim.from = view.contentY
+        readScrollAnim.to = target
+        readScrollAnim.start()
+    }
+
+    function readFinished() {
+        if (readMode === "doc")
+            setStatus("finished reading")
+        closeReader()
+    }
+
+    function readVoiceLabel(v) {
+        const m = /^([ab])([fm])_(.+)$/.exec(v)
+        if (!m)
+            return v
+        return m[3].charAt(0).toUpperCase() + m[3].slice(1) + " · "
+               + (m[1] === "a" ? "US" : "UK") + " " + (m[2] === "f" ? "F" : "M")
+    }
+
+    function readVoiceList() {
+        const out = []
+        for (const v of Reader.voices)
+            if (/^[ab][fm]_/.test(v))
+                out.push(v)
+        return out.length > 0 ? out : ["af_heart", "af_bella", "am_adam", "bf_emma", "bm_george"]
+    }
+
+
+    // Lyrics view: the spoken sentences, one line each, with the current one large.
+    function lyricsRebuild() {
+        lyricsModel = Reader.units()
+    }
+
+    function lyricsAccentB() {
+        const c = Theme.accent
+        const h = c.hslHue < 0 ? 0 : c.hslHue
+        return Qt.hsla((h + 0.12) % 1, Math.min(1, c.hslSaturation * 1.05),
+                       Math.min(0.82, c.hslLightness + 0.14), 1)
+    }
+
+    // The current sentence, coloured character by character from the accent to a
+    // lighter neighbouring hue, so it reads as a gradient along the reading order.
+    function lyricsGradientHtml(text) {
+        const a = Theme.accent
+        const b = lyricsAccentB()
+        const n = text.length
+        let out = ""
+        for (let i = 0; i < n; ++i) {
+            const ch = text[i]
+            if (ch === " ") {
+                out += " "
+                continue
+            }
+            const t = n > 1 ? i / (n - 1) : 0
+            const c = Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
+                              a.b + (b.b - a.b) * t, 1)
+            const esc = ch === "&" ? "&amp;" : (ch === "<" ? "&lt;" : (ch === ">" ? "&gt;" : ch))
+            out += '<font color="' + c.toString() + '">' + esc + "</font>"
+        }
+        return out
+    }
+
+    function lyricsFollow(animate) {
+        const idx = Reader.unit
+        if (idx < 0 || idx >= lyricsModel.length)
+            return
+        const it = lyricsList.itemAtIndex(idx)
+        if (!it) {
+            lyricsList.positionViewAtIndex(idx, ListView.Center)
+            return
+        }
+        const target = Math.max(0, it.y + it.height / 2 - lyricsList.height * 0.42)
+        if (!animate) {
+            lyricsList.contentY = target
+            return
+        }
+        lyricsScroll.stop()
+        lyricsScroll.from = lyricsList.contentY
+        lyricsScroll.to = target
+        lyricsScroll.start()
+    }
+
+    function toggleLyrics() {
+        if (!readActive || readAskInstall)
+            return
+        showLyrics = !showLyrics
+        if (showLyrics) {
+            lyricsRebuild()
+            lyricsFollow(false)
+        }
+    }
+
+
+    // ---------- magnifier ----------
+
+    // Where in a sentence the voice is: characters weighted so that commas and
+    // full stops, which the voice pauses on, take longer than letters.
+    function lensCharAt(text, progress) {
+        const n = text.length
+        if (n === 0)
+            return 0
+        const cumulative = []
+        let total = 0
+        for (let i = 0; i < n; ++i) {
+            const c = text[i]
+            let w = 1
+            if (c === " ")
+                w = 0.6
+            else if (",;:".indexOf(c) >= 0)
+                w = 4
+            else if (".!?".indexOf(c) >= 0 && (i === n - 1 || text[i + 1] === " "))
+                w = 7
+            total += w
+            cumulative.push(total)
+        }
+        const target = Math.max(0, Math.min(1, (progress - 0.03) / 0.93)) * total
+        for (let i = 0; i < n; ++i)
+            if (cumulative[i] >= target)
+                return i
+        return n - 1
+    }
+
+    function lensUpdate() {
+        if (!showLens || !readActive || readMode !== "doc" || Reader.state === 0)
+            return
+        const p = readList[Reader.paragraph]
+        if (!p || p.id === undefined)
+            return
+        const r = Reader.sentenceRanges(p.text)[Reader.sentence]
+        if (!r)
+            return
+        const offset = r.start + lensCharAt(p.text.slice(r.start, r.end), Reader.unitProgress)
+        const w = Doc.readingWordAt(p.id, offset)
+        if (w.page === undefined)
+            return
+        lensWord = w
+        const key = p.id + ":" + w.line
+        if (key === lensKey)
+            return
+        lensKey = key
+        const size = pageSizes[w.page] || { width: 612, height: 792 }
+        const bx = 0
+        const by = Math.max(0, w.y - w.h * 1.9)
+        const bw = size.width
+        const bh = Math.min(size.height - by, w.h * 4.8)
+        lensBand = { x: bx, y: by, w: bw, h: bh }
+        lensSource = "image://pages/r" + w.page + "_" + (lensZ * dpr).toFixed(2) + "_"
+                     + bx.toFixed(1) + "_" + by.toFixed(1) + "_" + bw.toFixed(1) + "_"
+                     + bh.toFixed(1) + "_" + Doc.generation
+    }
+
+    function toggleLens() {
+        if (!readActive || readAskInstall)
+            return
+        showLens = !showLens
+        lensKey = ""
+        if (showLens)
+            lensUpdate()
+    }
+
+    function readStepSpeed(dir) {
+        const steps = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+        let i = 0
+        for (let k = 0; k < steps.length; ++k)
+            if (Math.abs(steps[k] - Reader.speed) < 0.01)
+                i = k
+        Reader.speed = steps[Math.max(0, Math.min(steps.length - 1, i + dir))]
+    }
+
+    function readRemainingText() {
+        if (readMode !== "doc")
+            return ""
+        let chars = 0
+        for (let i = Math.max(0, Reader.paragraph); i < readList.length; ++i)
+            chars += readList[i].text.length
+        const mins = Math.round(chars / (900 * Reader.speed))
+        return mins < 1 ? "<1 min left" : "~" + mins + " min left"
+    }
+
+    NumberAnimation {
+        id: readScrollAnim
+        target: view
+        property: "contentY"
+        duration: 380
+        easing.type: Easing.OutCubic
+    }
+
+    Connections {
+        target: Features
+        function onAiChanged() {
+            if (!Features.ai) {
+                root.closeReader()
+                root.showLyrics = false
+                root.showLens = false
+                root.readAll = null
+            }
+        }
+    }
+
+    Connections {
+        target: Reader
+        function onProgressChanged() { root.lensUpdate() }
+        function onPositionChanged() {
+            root.readUpdateHighlight()
+            root.lensUpdate()
+            if (root.showLyrics)
+                root.lyricsFollow(true)
+        }
+        function onUnitsChanged() {
+            if (root.showLyrics) {
+                root.lyricsRebuild()
+                root.lyricsFollow(false)
+            }
+        }
+        function onFinished() { root.readFinished() }
+        function onErrorOccurred(message) { root.setStatus("read aloud: " + message) }
+        function onInstallOutput(line) { root.readInstallLog = line }
+        function onInstallFinished(ok) {
+            if (ok) {
+                root.readAskInstall = false
+                root.startReading()
+            } else {
+                root.readInstallLog = "Install failed. " + root.readInstallLog
+            }
+        }
     }
 
     // Select All: every text run on every page (native text, or OCR text on
@@ -1376,6 +1896,8 @@ Window {
                     : url.toString()
         saveViewState()
         if (Doc.open(path)) {
+            closeReader()
+            readAll = null
             navBack = []
             viewStateReady = false
             initialFitDone = false
@@ -1608,6 +2130,11 @@ Window {
                 Layout.maximumWidth: 130
                 renderType: Text.QtRendering
             }
+            HeaderButton {
+                label: "\u2699"
+                activeFlag: root.showSettings
+                onActivated: root.showSettings = !root.showSettings
+            }
             Rectangle {
                 id: keysButton
                 Layout.preferredWidth: keysLabel.implicitWidth + 24
@@ -1665,6 +2192,9 @@ Window {
             contentHeight: pagesCol.implicitHeight
             onContentXChanged: root.refreshViewportSelection()
             onContentYChanged: {
+                if (root.readActive && root.readMode === "doc" && Reader.state !== 0
+                        && Date.now() - root.readScrollStamp > 700)
+                    root.readFollow = false
                 root.refreshViewportSelection()
                 root.detectPage()
             }
@@ -2138,6 +2668,9 @@ Window {
         items.push({ label: "Actual Size", shortcut: "Ctrl+0", enabled: hasPages,
                      action: function() { zoom = 1.0 } })
         items.push({ separator: true })
+        if (aiOn)
+            items.push({ label: selectionText !== "" ? "Read Selection Aloud" : "Read Aloud",
+                         shortcut: "S", enabled: hasPages, action: function() { startReading() } })
         items.push({ label: "Read Text on This Page", shortcut: "Ctrl+Shift+O", enabled: hasPages,
                      action: function() { recognizeCurrentPage() } })
         return items
@@ -2238,6 +2771,784 @@ Window {
         }
     }
 
+
+
+    // ---------- lyrics view ----------
+
+    Rectangle {
+        id: lyricsPanel
+        visible: root.readActive && root.showLyrics
+        z: 55
+        anchors.top: header.bottom
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: 10
+        anchors.topMargin: 8
+        radius: Theme.cornerRadius + 6
+        // Opaque, whatever alpha the theme gives its darker background.
+        readonly property color solid: Qt.rgba(Theme.darkerBackground.r, Theme.darkerBackground.g,
+                                               Theme.darkerBackground.b, 1)
+        color: solid
+        border.color: Theme.mutedForeground
+        border.width: 1
+        clip: true
+
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }   // keep clicks off the page
+
+        ListView {
+            id: lyricsList
+            anchors.fill: parent
+            anchors.topMargin: 56
+            anchors.bottomMargin: 140
+            model: root.lyricsModel
+            interactive: true
+            boundsBehavior: Flickable.StopAtBounds
+            cacheBuffer: 2000
+            NumberAnimation {
+                id: lyricsScroll
+                target: lyricsList
+                property: "contentY"
+                duration: 520
+                easing.type: Easing.OutCubic
+            }
+
+            delegate: Item {
+                id: lyricRow
+                required property var modelData
+                required property int index
+                readonly property bool isCurrent: index === Reader.unit
+                readonly property bool silent: modelData.text === ""
+                readonly property bool paragraphStart: index === 0
+                    || root.lyricsModel[index - 1].paragraph !== modelData.paragraph
+                width: lyricsList.width
+                height: silent ? 0 : lineCell.height + (paragraphStart ? 34 : 12)
+                visible: !silent
+
+                Item {
+                    id: lineCell
+                    x: 44
+                    y: lyricRow.paragraphStart ? 22 : 0
+                    width: parent.width - 88
+                    height: plainText.implicitHeight
+                    transformOrigin: Item.Left
+                    scale: lyricRow.isCurrent ? 1.0 : 0.72
+                    opacity: lyricRow.isCurrent ? 1.0
+                             : Math.max(0.14, 0.5 - 0.09 * Math.abs(lyricRow.index - Reader.unit))
+                    Behavior on scale { NumberAnimation { duration: 320; easing.type: Easing.OutCubic } }
+                    Behavior on opacity { NumberAnimation { duration: 320 } }
+
+                    Text {
+                        id: plainText
+                        width: parent.width
+                        text: lyricRow.isCurrent ? root.lyricsGradientHtml(lyricRow.modelData.text)
+                                                 : lyricRow.modelData.text
+                        textFormat: lyricRow.isCurrent ? Text.StyledText : Text.PlainText
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: 40
+                        font.weight: Font.Bold
+                        lineHeight: 1.12
+                        color: Theme.foreground
+                        renderType: Text.QtRendering
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Reader.jumpToParagraph(lyricRow.modelData.paragraph)
+                    }
+                }
+            }
+        }
+
+        // Soften the top and bottom edges of the scrolling lines. The transparent
+        // end keeps the panel's own colour so the gradient does not pass through black.
+        Rectangle {
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 150
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: lyricsPanel.solid }
+                GradientStop { position: 0.45; color: lyricsPanel.solid }
+                GradientStop { position: 1.0; color: Qt.rgba(lyricsPanel.solid.r,
+                    lyricsPanel.solid.g, lyricsPanel.solid.b, 0) }
+            }
+        }
+        Rectangle {
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 250
+            gradient: Gradient {
+                GradientStop { position: 0.0; color: Qt.rgba(lyricsPanel.solid.r,
+                    lyricsPanel.solid.g, lyricsPanel.solid.b, 0) }
+                GradientStop { position: 1.0; color: lyricsPanel.solid }
+            }
+        }
+
+        Text {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.margins: 20
+            text: "♫  " + (Doc.fileName !== "" ? Doc.fileName : "Reading")
+            color: Theme.mutedForeground
+            font.pixelSize: 12
+            renderType: Text.QtRendering
+        }
+        HeaderButton {
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 14
+            label: "✕"
+            onActivated: root.showLyrics = false
+        }
+    }
+
+
+    // ---------- magnifier ----------
+
+    Rectangle {
+        id: lens
+        visible: root.readActive && root.showLens && root.readMode === "doc" && !root.readAskInstall
+        z: 58
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: readBar.top
+        anchors.bottomMargin: 10
+        width: Math.min(820, parent.width - 32)
+        height: 210
+        radius: Theme.cornerRadius + 6
+        color: Qt.rgba(Theme.darkerBackground.r, Theme.darkerBackground.g, Theme.darkerBackground.b, 1)
+        border.color: Theme.accent
+        border.width: 2
+        onWidthChanged: root.lensZ = Math.max(2.2, Math.min(4.0, (width - 12) / 300))
+
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }
+
+        Item {
+            id: lensView
+            anchors.fill: parent
+            anchors.margins: 6
+            clip: true
+
+            Rectangle { anchors.fill: parent; color: "white"; radius: Math.max(0, lens.radius - 6) }
+
+            Image {
+                id: bandImage
+                source: root.lensSource
+                asynchronous: true
+                retainWhileLoading: true
+                cache: false
+                smooth: true
+                fillMode: Image.Stretch
+                width: root.lensBand.w * root.lensZ
+                height: root.lensBand.h * root.lensZ
+                // Keep the current word under the lens centre; the line slides past.
+                readonly property real wordCx: root.lensWord ? root.lensWord.x + root.lensWord.w / 2 : 0
+                readonly property real wordCy: root.lensWord ? root.lensWord.y + root.lensWord.h / 2 : 0
+                x: lensView.width / 2 - (wordCx - root.lensBand.x) * root.lensZ
+                y: lensView.height / 2 - (wordCy - root.lensBand.y) * root.lensZ
+            }
+
+            // The word being spoken stays fixed in the middle of the lens; only the
+            // page slides underneath it.
+            Rectangle {
+                visible: root.lensWord !== null
+                width: root.lensWord ? root.lensWord.w * root.lensZ + 10 : 0
+                height: root.lensWord ? root.lensWord.h * root.lensZ + 8 : 0
+                x: (lensView.width - width) / 2
+                y: (lensView.height - height) / 2
+                radius: 5
+                color: Qt.rgba(Theme.accent.r, Theme.accent.g, Theme.accent.b, 0.28)
+                border.color: Theme.accent
+                border.width: 2
+            }
+
+            Rectangle {      // soft edges, like looking through glass
+                anchors.left: parent.left
+                width: 60
+                height: parent.height
+                gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop { position: 0.0; color: "#ccffffff" }
+                    GradientStop { position: 1.0; color: "#00ffffff" }
+                }
+            }
+            Rectangle {
+                anchors.right: parent.right
+                width: 60
+                height: parent.height
+                gradient: Gradient {
+                    orientation: Gradient.Horizontal
+                    GradientStop { position: 0.0; color: "#00ffffff" }
+                    GradientStop { position: 1.0; color: "#ccffffff" }
+                }
+            }
+        }
+
+        HeaderButton {
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 12
+            width: 24
+            height: 24
+            label: "✕"
+            onActivated: root.showLens = false
+        }
+    }
+
+    // ---------- read aloud bar ----------
+
+    component ReadChip: Rectangle {
+        id: chip
+        property string label
+        property bool on: false
+        signal toggled()
+        height: 24
+        width: chipText.implicitWidth + 20
+        radius: 12
+        color: on ? Theme.selection : "transparent"
+        border.color: on ? Theme.accent : Theme.mutedForeground
+        border.width: 1
+        Text {
+            id: chipText
+            anchors.centerIn: parent
+            text: (chip.on ? "✓ " : "") + chip.label
+            color: chip.on ? Theme.foreground : Theme.mutedForeground
+            font.pixelSize: 11
+            renderType: Text.QtRendering
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: chip.toggled()
+        }
+    }
+
+    Rectangle {      // "follow reading" chip after the user scrolls away
+        visible: root.readActive && root.readMode === "doc" && !root.readFollow
+                 && Reader.state !== 0 && !root.readAskInstall
+        z: 61
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: lens.visible ? lens.top : readBar.top
+        anchors.bottomMargin: 8
+        width: followText.implicitWidth + 24
+        height: 28
+        radius: 14
+        color: Theme.accent
+        Text {
+            id: followText
+            anchors.centerIn: parent
+            text: "Jump back to reading"
+            color: Theme.darkerBackground
+            font.pixelSize: 12
+            font.weight: Font.DemiBold
+            renderType: Text.QtRendering
+        }
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: {
+                root.readFollow = true
+                root.readUpdateHighlight()
+            }
+        }
+    }
+
+    Rectangle {      // voice picker
+        visible: root.readActive && root.showVoices
+        z: 62
+        anchors.right: readBar.right
+        anchors.rightMargin: 44
+        anchors.bottom: readBar.top
+        anchors.bottomMargin: 8
+        width: 190
+        height: Math.min(voiceCol.implicitHeight, Math.max(120, root.height - readBar.height - 90)) + 12
+        radius: Theme.cornerRadius
+        color: Theme.darkerBackground
+        border.color: Theme.mutedForeground
+        border.width: 1
+        MouseArea { anchors.fill: parent }
+        Flickable {
+            x: 6
+            y: 6
+            width: parent.width - 12
+            height: parent.height - 12
+            clip: true
+            contentWidth: width
+            contentHeight: voiceCol.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            Column {
+                id: voiceCol
+                width: parent.width
+                Repeater {
+                    model: root.showVoices ? root.readVoiceList() : []
+                    delegate: Rectangle {
+                        width: voiceCol.width
+                        height: 28
+                        radius: Math.max(0, Theme.cornerRadius - 4)
+                        color: voiceMouse.containsMouse ? Theme.selection : "transparent"
+                        Text {
+                            x: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: root.readVoiceLabel(modelData)
+                            color: modelData === Reader.voice ? Theme.accent : Theme.foreground
+                            font.pixelSize: 13
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            id: voiceMouse
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                Reader.voice = modelData
+                                root.showVoices = false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Rectangle {
+        id: readBar
+        visible: root.readActive
+        z: 60
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: 14
+        width: Math.min(700, parent.width - 24)
+        height: barColumn.implicitHeight + 22
+        radius: Theme.cornerRadius + 4
+        color: Theme.darkerBackground
+        border.color: Theme.mutedForeground
+        border.width: 1
+
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }   // swallow clicks
+
+        Column {
+            id: barColumn
+            x: 14
+            y: 11
+            width: parent.width - 28
+            spacing: 9
+
+            // One-time download prompt (read aloud is opt-in).
+            Column {
+                visible: root.readAskInstall
+                width: parent.width
+                spacing: 8
+                Text {
+                    width: parent.width
+                    text: Reader.installing ? "Setting up read aloud…"
+                                            : "Read aloud runs a speech model on your computer"
+                    color: Theme.foreground
+                    font.pixelSize: 14
+                    font.weight: Font.DemiBold
+                    renderType: Text.QtRendering
+                }
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: Reader.installing ? (root.readInstallLog !== "" ? root.readInstallLog : "Starting…")
+                          : (root.readInstallLog !== "" ? root.readInstallLog
+                             : "It needs a one-time download of about 600 MB (the Kokoro voice model and a small Python runtime). Nothing is sent anywhere; everything stays local.")
+                    color: Theme.mutedForeground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                Row {
+                    spacing: 8
+                    Rectangle {
+                        visible: !Reader.installing
+                        width: dlText.implicitWidth + 24
+                        height: 28
+                        radius: 14
+                        color: Theme.accent
+                        Text {
+                            id: dlText
+                            anchors.centerIn: parent
+                            text: "Download and enable"
+                            color: Theme.darkerBackground
+                            font.pixelSize: 12
+                            font.weight: Font.DemiBold
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: { root.readInstallLog = ""; Reader.install() }
+                        }
+                    }
+                    Rectangle {
+                        visible: !Reader.installing
+                        width: cancelText.implicitWidth + 24
+                        height: 28
+                        radius: 14
+                        color: "transparent"
+                        border.color: Theme.mutedForeground
+                        border.width: 1
+                        Text {
+                            id: cancelText
+                            anchors.centerIn: parent
+                            text: "Not now"
+                            color: Theme.mutedForeground
+                            font.pixelSize: 12
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.closeReader()
+                        }
+                    }
+                }
+            }
+
+            // Transport row.
+            RowLayout {
+                visible: !root.readAskInstall
+                width: parent.width
+                spacing: 4
+
+                HeaderButton { width: 30; height: 30; label: "«"; onActivated: Reader.previousParagraph() }
+                HeaderButton { width: 30; height: 30; label: "‹"; onActivated: Reader.previousSentence() }
+                Rectangle {
+                    Layout.preferredWidth: 38
+                    Layout.preferredHeight: 38
+                    radius: 19
+                    color: Theme.accent
+                    Text {
+                        anchors.centerIn: parent
+                        text: Reader.state === 2 ? "❚❚" : (Reader.state === 1 ? "…" : "▶")
+                        color: Theme.darkerBackground
+                        font.pixelSize: 14
+                        renderType: Text.QtRendering
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.toggleReading()
+                    }
+                }
+                HeaderButton { width: 30; height: 30; label: "›"; onActivated: Reader.nextSentence() }
+                HeaderButton { width: 30; height: 30; label: "»"; onActivated: Reader.nextParagraph() }
+
+                Item { Layout.fillWidth: true }
+
+                HeaderButton { width: 26; height: 26; label: "−"; onActivated: root.readStepSpeed(-1) }
+                Text {
+                    text: Reader.speed.toFixed(2).replace(/0$/, "") + "×"
+                    Layout.preferredWidth: 38
+                    horizontalAlignment: Text.AlignHCenter
+                    color: Theme.foreground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                HeaderButton { width: 26; height: 26; label: "+"; onActivated: root.readStepSpeed(1) }
+
+                Rectangle {
+                    Layout.preferredWidth: voiceText.implicitWidth + 22
+                    Layout.preferredHeight: 26
+                    Layout.leftMargin: 8
+                    radius: 6
+                    color: voiceBtn.containsMouse || root.showVoices ? Theme.selection : "transparent"
+                    border.color: root.showVoices ? Theme.accent : Theme.mutedForeground
+                    border.width: 1
+                    Text {
+                        id: voiceText
+                        anchors.centerIn: parent
+                        text: root.readVoiceLabel(Reader.voice) + " ▾"
+                        color: Theme.foreground
+                        font.pixelSize: 12
+                        renderType: Text.QtRendering
+                    }
+                    MouseArea {
+                        id: voiceBtn
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.showVoices = !root.showVoices
+                    }
+                }
+                HeaderButton { width: 26; height: 26; Layout.leftMargin: 4; label: "✕"; onActivated: root.closeReader() }
+            }
+
+            // Progress row.
+            Item {
+                visible: !root.readAskInstall && root.readMode === "doc"
+                width: parent.width
+                height: 18
+                Rectangle {
+                    id: progressTrack
+                    anchors.left: parent.left
+                    anchors.right: infoText.left
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: 4
+                    radius: 2
+                    color: Theme.mutedForeground
+                    opacity: 1
+                    Rectangle {
+                        height: parent.height
+                        radius: 2
+                        color: Theme.accent
+                        width: root.readList.length > 0
+                               ? parent.width * Math.max(0, Reader.paragraph + 1) / root.readList.length : 0
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.topMargin: -7
+                        anchors.bottomMargin: -7
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: (mouse) => {
+                            root.readFollow = true
+                            Reader.jumpToParagraph(Math.floor(mouse.x / progressTrack.width * root.readList.length))
+                        }
+                    }
+                }
+                Text {
+                    id: infoText
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: Reader.state === 1 ? "Loading voice…"
+                          : "¶ " + (Reader.paragraph + 1) + " of " + root.readList.length
+                            + " · p." + (Reader.paragraph >= 0 && root.readList[Reader.paragraph]
+                                              ? root.readList[Reader.paragraph].page + 1 : "")
+                            + " · " + root.readRemainingText()
+                    color: Theme.mutedForeground
+                    font.pixelSize: 11
+                    renderType: Text.QtRendering
+                }
+            }
+            Text {
+                visible: !root.readAskInstall && root.readMode === "selection"
+                text: Reader.state === 1 ? "Loading voice…" : "Reading the selection"
+                color: Theme.mutedForeground
+                font.pixelSize: 11
+                renderType: Text.QtRendering
+            }
+
+            // What to leave out.
+            Flow {
+                visible: !root.readAskInstall && root.readMode === "doc"
+                width: parent.width
+                spacing: 6
+                ReadChip { label: "Skip headers, footers & margin text"; on: root.readSkips.headers
+                           onToggled: root.readToggleSkip("headers") }
+                ReadChip { label: "Skip footnotes"; on: root.readSkips.footnotes
+                           onToggled: root.readToggleSkip("footnotes") }
+                ReadChip { label: "Skip captions"; on: root.readSkips.captions
+                           onToggled: root.readToggleSkip("captions") }
+                ReadChip { label: "Skip tables"; on: root.readSkips.tables
+                           onToggled: root.readToggleSkip("tables") }
+                ReadChip { label: "Skip equations"; on: root.readSkips.math
+                           onToggled: root.readToggleSkip("math") }
+                ReadChip { label: "Skip references"; on: root.readSkips.references
+                           onToggled: root.readToggleSkip("references") }
+                ReadChip { label: "\u2715 Don't read this"; on: false
+                           onToggled: root.readSkipCurrent() }
+            }
+        }
+    }
+
+
+    // ---------- settings ----------
+
+    MouseArea {   // click outside the panel to close it
+        anchors.fill: parent
+        visible: root.showSettings
+        z: 90
+        onClicked: root.showSettings = false
+    }
+
+    Rectangle {
+        id: settingsPanel
+        visible: root.showSettings
+        z: 100
+        anchors.top: parent.top
+        anchors.topMargin: header.height + 6
+        anchors.right: parent.right
+        anchors.rightMargin: 8
+        width: Math.min(440, parent.width - 16)
+        height: settingsColumn.implicitHeight + 32
+        radius: Theme.cornerRadius
+        color: Theme.darkerBackground
+        border.color: Theme.mutedForeground
+        border.width: 1
+        onVisibleChanged: root.confirmRemoveModel = false
+
+        MouseArea { anchors.fill: parent }   // swallow clicks on the panel itself
+
+        Column {
+            id: settingsColumn
+            x: 18
+            y: 16
+            width: parent.width - 36
+            spacing: 14
+
+            Text {
+                text: "Settings"
+                color: Theme.foreground
+                font.pixelSize: 15
+                font.weight: Font.DemiBold
+                renderType: Text.QtRendering
+            }
+
+            Item {
+                width: parent.width
+                height: aiText.implicitHeight
+
+                Column {
+                    id: aiText
+                    anchors.left: parent.left
+                    anchors.right: aiSwitch.left
+                    anchors.rightMargin: 16
+                    spacing: 5
+                    Text {
+                        text: "AI features"
+                        color: Theme.foreground
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        renderType: Text.QtRendering
+                    }
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: "Read aloud with a natural local voice, its lyrics and magnifier views, and the smart filter that skips headers, footers, tables and margin text. It all runs on your computer and nothing is uploaded. Switched off, none of it exists: no keys, menu entries, background processes or downloads."
+                        color: Theme.mutedForeground
+                        font.pixelSize: 12
+                        lineHeight: 1.15
+                        renderType: Text.QtRendering
+                    }
+                }
+
+                Rectangle {
+                    id: aiSwitch
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    width: 44
+                    height: 24
+                    radius: 12
+                    color: root.aiOn ? Theme.accent : Theme.selection
+                    border.color: root.aiOn ? Theme.accent : Theme.mutedForeground
+                    border.width: 1
+                    Rectangle {
+                        width: 18
+                        height: 18
+                        radius: 9
+                        y: 3
+                        x: root.aiOn ? parent.width - width - 3 : 3
+                        color: root.aiOn ? Theme.darkerBackground : Theme.foreground
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Features.ai = !Features.ai
+                    }
+                }
+            }
+
+            Rectangle {
+                visible: root.aiOn
+                width: parent.width
+                height: 1
+                color: Theme.mutedForeground
+                opacity: 0.35
+            }
+
+            Column {
+                visible: root.aiOn
+                width: parent.width
+                spacing: 10
+
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    text: Reader.available
+                          ? "Voice model: installed" + (Reader.diskUsage() !== "" ? " (" + Reader.diskUsage() + " on disk)" : "")
+                          : "Voice model: not downloaded yet. It downloads the first time you press s."
+                    color: Theme.foreground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+
+                Flow {
+                    width: parent.width
+                    spacing: 8
+
+                    Rectangle {
+                        visible: Reader.available
+                        width: removeText.implicitWidth + 24
+                        height: 28
+                        radius: 14
+                        color: root.confirmRemoveModel ? Theme.accent : "transparent"
+                        border.color: root.confirmRemoveModel ? Theme.accent : Theme.mutedForeground
+                        border.width: 1
+                        Text {
+                            id: removeText
+                            anchors.centerIn: parent
+                            text: root.confirmRemoveModel ? "Click again to delete it" : "Remove downloaded voice model"
+                            color: root.confirmRemoveModel ? Theme.darkerBackground : Theme.foreground
+                            font.pixelSize: 12
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                if (!root.confirmRemoveModel) {
+                                    root.confirmRemoveModel = true
+                                } else {
+                                    root.confirmRemoveModel = false
+                                    root.closeReader()
+                                    Reader.removeModel()
+                                    root.setStatus("voice model removed")
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: resetText.implicitWidth + 24
+                        height: 28
+                        radius: 14
+                        color: "transparent"
+                        border.color: Theme.mutedForeground
+                        border.width: 1
+                        Text {
+                            id: resetText
+                            anchors.centerIn: parent
+                            text: "Reset what Glance learned"
+                            color: Theme.foreground
+                            font.pixelSize: 12
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                Doc.resetReadingModel()
+                                root.readAll = null
+                                root.setStatus("learned filtering reset")
+                            }
+                        }
+                    }
+                }
+            }
+
+            Text {
+                width: parent.width
+                text: "Ctrl+, opens this panel."
+                color: Theme.mutedForeground
+                font.pixelSize: 11
+                renderType: Text.QtRendering
+            }
+        }
+    }
+
     // ---------- keybindings panel ----------
     // Each row: keys to show, a plain-language explanation, and (optionally) the
     // action to run when the row is clicked.
@@ -2283,6 +3594,19 @@ Window {
               action: function() { root.copyPage() } },
             { keys: ["Ctrl+Shift+o"], desc: "Read this page's text right now. Normally automatic.",
               action: function() { root.recognizeCurrentPage() } }
+        ] },
+        { title: "Read aloud", items: [
+            { keys: ["s"], desc: "Read aloud. With text selected it reads the selection; otherwise it reads the document from the top of the window, skipping headers, footers, page numbers and footnotes. While reading, s pauses and resumes.",
+              action: function() { root.toggleReading() } },
+            { keys: ["[", "]"], desc: "Previous / next paragraph while reading." },
+            { keys: ["{", "}"], desc: "Previous / next sentence while reading." },
+            { keys: ["Click a paragraph"], desc: "While reading, continue from the paragraph you click. Click a dimmed (skipped) one to include it." },
+            { keys: ["m"], desc: "Magnifier: a zoomed view of the page above the player that follows the word being spoken. Word position is estimated from the speech timing, so it can drift by a word or so.",
+              action: function() { root.toggleLens() } },
+            { keys: ["v"], desc: "Lyrics view: the sentences scroll past in large type over the document, current one in your accent colour. Click a line to jump there; Esc closes it.",
+              action: function() { root.toggleLyrics() } },
+            { keys: ["x"], desc: "Don't read this paragraph. Glance learns from it: similar margin text, figure labels and so on are skipped from then on, in every document." },
+            { keys: ["Esc"], desc: "Stop reading." }
         ] },
         { title: "Mouse and trackpad", items: [
             { keys: ["Right-click"], desc: "Menu: copy, select all, previous / next page, back, reload, open the file's folder, zoom, read text." },
@@ -2357,7 +3681,7 @@ Window {
                 }
 
                 Repeater {
-                    model: root.keySections
+                    model: root.keySections.filter(s => root.aiOn || s.title !== "Read aloud")
                     delegate: Column {
                         width: keysColumn.width
                         spacing: 2
@@ -2451,10 +3775,27 @@ Window {
     Shortcut { sequence: "Ctrl+r"; enabled: !root.typing; onActivated: root.reloadFile(false) }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
                onActivated: root.recognizeCurrentPage() }
+    Shortcut { sequence: "Ctrl+,"; onActivated: root.showSettings = !root.showSettings }
+    Shortcut { sequence: "s"; enabled: !root.typing; onActivated: root.toggleReading() }
+    Shortcut { sequence: "]"; enabled: !root.typing && root.readActive; onActivated: Reader.nextParagraph() }
+    Shortcut { sequence: "["; enabled: !root.typing && root.readActive; onActivated: Reader.previousParagraph() }
+    Shortcut { sequence: "m"; enabled: !root.typing && root.readActive; onActivated: root.toggleLens() }
+    Shortcut { sequence: "v"; enabled: !root.typing && root.readActive; onActivated: root.toggleLyrics() }
+    Shortcut { sequence: "x"; enabled: !root.typing && root.readActive; onActivated: root.readSkipCurrent() }
+    Shortcut { sequence: "}"; enabled: !root.typing && root.readActive; onActivated: Reader.nextSentence() }
+    Shortcut { sequence: "{"; enabled: !root.typing && root.readActive; onActivated: Reader.previousSentence() }
     Shortcut { sequence: "Escape"; onActivated: {
         root.vimCount = 0
         root.gPending = false
-        if (root.showMenu)
+        if (root.showSettings)
+            root.showSettings = false
+        else if (root.showVoices)
+            root.showVoices = false
+        else if (root.showLens)
+            root.showLens = false
+        else if (root.showLyrics)
+            root.showLyrics = false
+        else if (root.showMenu)
             root.showMenu = false
         else if (root.showKeys)
             root.showKeys = false
@@ -2462,6 +3803,8 @@ Window {
             root.closeCommand()
         else if (root.searchActive)
             root.closeSearch()
+        else if (root.readActive)
+            root.closeReader()
         else
             root.clearSelection()
     } }
