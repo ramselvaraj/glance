@@ -24,6 +24,7 @@ qt_add_executable(glance
     src/main.cpp
     src/document.cpp
     src/readingtext.cpp
+    src/reader.cpp
     src/pageprovider.cpp
     src/ocrmanager.cpp
     src/inputstate.cpp
@@ -31,7 +32,9 @@ qt_add_executable(glance
 )
 target_compile_definitions(glance PRIVATE
     QML_MAIN_SOURCE_S="${CMAKE_SOURCE_DIR}/qml/Main.qml"
-    RAPIDOCR_WORKER_SOURCE_S="${CMAKE_SOURCE_DIR}/scripts/rapidocr-worker.py")
+    RAPIDOCR_WORKER_SOURCE_S="${CMAKE_SOURCE_DIR}/scripts/rapidocr-worker.py"
+    KOKORO_WORKER_SOURCE_S="${CMAKE_SOURCE_DIR}/scripts/kokoro-worker.py"
+    SETUP_TTS_SOURCE_S="${CMAKE_SOURCE_DIR}/scripts/setup-tts.sh")
 target_include_directories(glance PRIVATE third_party/mupdf/include)
 target_link_libraries(glance PRIVATE
     Qt6::Quick Qt6::Qml

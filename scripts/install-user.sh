@@ -18,6 +18,8 @@ if [ ! -x "$lib_dir/ocr-runtime/bin/python" ] \
         || ! "$lib_dir/ocr-runtime/bin/python" -c 'import rapidocr, onnxruntime' >/dev/null 2>&1; then
     sh "$repo_dir/scripts/setup-rapidocr.sh" "$lib_dir/ocr-runtime"
 fi
+install -m 755 "$repo_dir/scripts/kokoro-worker.py" "$lib_dir/glance-kokoro-worker"
+install -m 755 "$repo_dir/scripts/setup-tts.sh" "$lib_dir/glance-setup-tts"
 rm -rf "$lib_dir/qml"
 cp -R "$repo_dir/qml" "$lib_dir/qml"
 find "$lib_dir/qml" -type f -exec chmod 644 {} +

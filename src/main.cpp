@@ -14,6 +14,7 @@
 #include "document.h"
 #include "pageprovider.h"
 #include "ocrmanager.h"
+#include "reader.h"
 #include "inputstate.h"
 #include "theme.h"
 #include <QThread>
@@ -61,6 +62,14 @@ int main(int argc, char *argv[])
     QCommandLineOption readSelfOpt(QStringLiteral("read-selftest"),
                                    QStringLiteral("Print read-aloud paragraphs and exit"));
     parser.addOption(readSelfOpt);
+    QCommandLineOption ttsSelfOpt(QStringLiteral("tts-selftest"),
+                                  QStringLiteral("Read the first N body paragraphs aloud and exit"),
+                                  QStringLiteral("count"), QStringLiteral("2"));
+    parser.addOption(ttsSelfOpt);
+    QCommandLineOption cleanSelfOpt(QStringLiteral("clean-selftest"),
+                                    QStringLiteral("Print how a sentence is cleaned for speech"),
+                                    QStringLiteral("text"));
+    parser.addOption(cleanSelfOpt);
     parser.addPositionalArgument("file", "Document to open (pdf/images). Optional.");
     parser.process(app);
 
@@ -213,6 +222,59 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    if (parser.isSet(cleanSelfOpt)) {
+        printf("%s\n", Reader::speakable(parser.value(cleanSelfOpt)).toUtf8().constData());
+        return 0;
+    }
+
+    if (parser.isSet(ttsSelfOpt)) {
+        if (!doc->isOpen())
+            return 1;
+        const int want = parser.value(ttsSelfOpt).toInt();
+        QStringList texts;
+        for (const QVariant &v : doc->readingParagraphs({})) {
+            const QVariantMap m = v.toMap();
+            if (!m.value("skipped").toBool() && m.value("kind").toString() != "heading"
+                && m.value("text").toString().size() > 80)
+                texts << m.value("text").toString();
+            if (texts.size() >= want)
+                break;
+        }
+        for (const QString &t : texts) {
+            const QStringList sents = Reader::splitSentences(t);
+            fprintf(stderr, "tts-selftest: paragraph of %d chars -> %d sentences\n", int(t.size()), int(sents.size()));
+            for (const QString &x : sents)
+                fprintf(stderr, "    [%s]\n", x.left(90).toUtf8().constData());
+        }
+        auto *reader = new Reader(&app);
+        auto *clock = new QElapsedTimer;
+        clock->start();
+        fprintf(stderr, "tts-selftest: available=%d paragraphs=%d\n",
+                int(reader->available()), int(texts.size()));
+        QObject::connect(reader, &Reader::stateChanged, &app, [reader, clock] {
+            fprintf(stderr, "tts-selftest: %lldms state=%d\n", clock->elapsed(), int(reader->state()));
+        });
+        QObject::connect(reader, &Reader::positionChanged, &app, [reader, clock] {
+            fprintf(stderr, "tts-selftest: %lldms para=%d sentence=%d\n", clock->elapsed(),
+                    reader->paragraph(), reader->sentence());
+        });
+        QObject::connect(reader, &Reader::errorOccurred, &app, [](const QString &e) {
+            fprintf(stderr, "tts-selftest: error %s\n", e.toUtf8().constData());
+        });
+        QObject::connect(reader, &Reader::finished, &app, [&app] { app.quit(); });
+        QObject::connect(reader, &Reader::errorOccurred, &app, [&app] { app.quit(); });
+        if (qEnvironmentVariableIsSet("GLANCE_TTS_CONTROLS")) {
+            QTimer::singleShot(4000, reader, [reader] { fprintf(stderr, "-- pause\n"); reader->pause(); });
+            QTimer::singleShot(6000, reader, [reader] { fprintf(stderr, "-- resume\n"); reader->resume(); });
+            QTimer::singleShot(9000, reader, [reader] { fprintf(stderr, "-- nextSentence\n"); reader->nextSentence(); });
+            QTimer::singleShot(12000, reader, [reader] { fprintf(stderr, "-- speed 1.5\n"); reader->setSpeed(1.5); });
+            QTimer::singleShot(16000, reader, [reader] { fprintf(stderr, "-- previousParagraph\n"); reader->previousParagraph(); });
+            QTimer::singleShot(20000, reader, [reader] { fprintf(stderr, "-- stop\n"); reader->stop(); QCoreApplication::quit(); });
+        }
+        reader->start(texts, 0);
+        return app.exec();
+    }
+
     if (parser.isSet(readSelfOpt)) {
         if (!doc->isOpen())
             return 1;
@@ -353,6 +415,8 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("Doc", doc);
     engine.rootContext()->setContextProperty("Ocr", &ocr);
+    Reader reader;
+    engine.rootContext()->setContextProperty("Reader", &reader);
     engine.rootContext()->setContextProperty("Input", &input);
     engine.rootContext()->setContextProperty("InitialWindowWidth", initialWidth);
     engine.rootContext()->setContextProperty("InitialWindowHeight", initialHeight);
