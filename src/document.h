@@ -11,6 +11,9 @@
 #include <QVariantMap>
 #include <QHash>
 #include <QThreadPool>
+#include <QFileSystemWatcher>
+#include <QTimer>
+#include <QStringList>
 #include <atomic>
 
 #include <mupdf/fitz.h>
@@ -20,6 +23,9 @@ class Document : public QObject {
     Q_PROPERTY(int pageCount READ pageCount NOTIFY pageCountChanged)
     Q_PROPERTY(QString fileName READ fileName NOTIFY pageCountChanged)
     Q_PROPERTY(QString filePath READ filePath NOTIFY pageCountChanged)
+    // Bumped on every (re)load so page/thumbnail image URLs change and a reloaded
+    // file never shows the previous version from the pixmap cache.
+    Q_PROPERTY(int generation READ generation NOTIFY pageCountChanged)
     // What is actually opened: the file itself, or a cached PNG made from a
     // format MuPDF cannot read but Qt can (WebP, ICO, TGA). Use this for OCR.
     Q_PROPERTY(QString ocrPath READ ocrPath NOTIFY pageCountChanged)
@@ -33,6 +39,7 @@ public:
     bool ok() const { return m_doc != nullptr; }
     QString fileName() const;
     QString filePath() const { return m_path; }
+    int generation() const { return m_generation; }
     QString ocrPath() const { return m_openPath.isEmpty() ? m_path : m_openPath; }
 
     int pageCount() const { return m_pageCount; }
@@ -40,6 +47,11 @@ public:
     // Closes the current file (if any) and opens path. Returns false if the
     // file cannot be opened (state becomes: empty, no document).
     Q_INVOKABLE bool open(const QString &path);
+    // Opens the folder holding the file in the desktop file manager.
+    Q_INVOKABLE bool openContainingFolder() const;
+    // Text of every page (native text, geometric order), computed off the GUI
+    // thread: allTextReady(generation, pages) with one string per page.
+    Q_INVOKABLE void requestAllText();
 
     // Page size in PDF points. Thread-safe.
     Q_INVOKABLE QSizeF pageSizePt(int page) const;
@@ -103,6 +115,10 @@ public:
     bool isOpen() const { return m_doc != nullptr; }
 
 signals:
+    // The open file changed on disk and the new version is fully written and
+    // readable; the viewer should reload it (keeping its place).
+    void fileChangedOnDisk();
+    void allTextReady(int generation, const QStringList &pages);
     void linksReady(int page, const QVariantList &links);
     void pageCountChanged(int count);
     void searchFinished(int generation, const QVariantList &results);
@@ -125,7 +141,19 @@ private:
     fz_context *m_ctx = nullptr;
     fz_document *m_doc = nullptr;
     QString m_path;
-    QString m_openPath;   // converted PNG when the original needed conversion
+    QString m_openPath;
+    int m_generation = 0;
+    std::atomic<bool> m_textAbort{false};   // stops requestAllText() on reset
+    // Watching the open file for changes (editors/LaTeX rewrite or replace it).
+    QFileSystemWatcher m_fileWatcher;
+    QTimer m_changeTimer;
+    qint64 m_loadedSize = -1;
+    qint64 m_loadedMtime = 0;
+    qint64 m_lastSeenSize = -1;
+    qint64 m_lastSeenMtime = 0;
+    int m_changeRetries = 0;
+    void watchFile();
+    void checkFileChange();   // converted PNG when the original needed conversion
     int m_pageCount = 0;
     QVector<QSizeF> m_sizes;
     QVector<QPointF> m_origins;

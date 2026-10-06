@@ -24,7 +24,7 @@ Item {
 
     // The parent Loader virtualizes pages outside the viewport.
     readonly property string requestedSource: (page >= 0 && ready)
-        ? "image://pages/p" + page + "_" + renderedExp + "_" + dpr
+        ? "image://pages/p" + page + "_" + renderedExp + "_" + dpr + "_" + Doc.generation
         : ""
     property string shownSource: ""
 

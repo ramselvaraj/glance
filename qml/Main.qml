@@ -19,6 +19,14 @@ Window {
     property var outlineModel: []
     property bool searchActive: false
     property bool showKeys: false
+    property bool showMenu: false
+    property point menuPos: Qt.point(0, 0)
+    property var menuItems: []
+    // "Select All" spans every page: boxes are produced lazily per visible page,
+    // the full text is gathered in the background (Doc.requestAllText).
+    property bool selectAllDoc: false
+    property bool copyAfterAllText: false
+    property var allDocBoxes: ({})
     property bool searchBackward: false
     property bool cmdActive: false
     property int vimCount: 0
@@ -614,33 +622,87 @@ Window {
     }
 
     function copyPage() {
-        if (selectionText !== "" && Doc.copyTextToClipboard(selectionText))
+        if (selectAllDoc && selectionText === "") {
+            // Whole-document text is still being gathered; copy as soon as it's ready.
+            copyAfterAllText = true
+            setStatus("preparing text of all pages…")
             return
+        }
+        if (selectionText !== "" && Doc.copyTextToClipboard(selectionText)) {
+            if (selectAllDoc)
+                setStatus("copied " + selectionText.length + " characters")
+            return
+        }
         if (pageCount > 0 && Doc.copyPageToClipboard(currentPage - 1))
             console.log("glance: page copied to clipboard")
     }
 
-    // Select every recognised/native text run on the current page.
-    function selectAllOnPage() {
+    // Header status line, cleared after a few seconds.
+    function setStatus(text) {
+        ocrStatus = text
+        statusClearTimer.restart()
+    }
+
+    // Select All: every text run on every page (native text, or OCR text on
+    // pages that have none).
+    function selectAllDocument() {
+        if (pageCount === 0)
+            return
+        allDocBoxes = ({})
+        selectAllDoc = true
+        selectionText = ""
+        const marker = {}
+        marker["*"] = true          // changes selectionPages so page overlays refresh
+        selectionPages = marker
+        Doc.requestAllText()
+    }
+
+    function composeAllText(pages) {
+        const out = []
+        for (let p = 0; p < pages.length; ++p) {
+            let text = pages[p]
+            if (text === "" && ocrPages[p])
+                text = ocrText(sortedOcrWords(p))
+            if (text !== "")
+                out.push(text)
+        }
+        return out.join("\n\n")
+    }
+
+    // Highlight boxes of one page while Select All spans the document.
+    function allDocBoxesForPage(page) {
+        if (allDocBoxes[page] !== undefined)
+            return allDocBoxes[page]
+        const size = Doc.pageSizePt(page)
+        let boxes = Doc.selectText(page, Qt.point(0, 0), Qt.point(size.width, size.height)).boxes
+        if (boxes.length === 0 && ocrPages[page])
+            boxes = sortedOcrWords(page)
+        allDocBoxes[page] = boxes     // plain cache; no binding depends on it
+        return boxes
+    }
+
+    // Select All OCR Text: the words recognised by OCR on the current page, e.g.
+    // a screenshot inside a PDF, or a whole standalone image.
+    function selectAllOcrOnPage() {
         if (pageCount === 0)
             return
         const page = Math.max(0, currentPage - 1)
-        const size = Doc.pageSizePt(page)
-        const native = Doc.selectText(page, Qt.point(0, 0), Qt.point(size.width, size.height))
-        const pages = {}
-        if (ocrPages[page] && (!ocrPages[page].embeddedText || native.text === "")) {
-            const words = sortedOcrWords(page)
-            pages[page] = words
-            selectionPages = pages
-            selectionText = ocrText(words)
-        } else {
-            pages[page] = native.boxes
-            selectionPages = pages
-            selectionText = native.text
+        const words = sortedOcrWords(page)
+        if (words.length === 0) {
+            setStatus(Ocr.running ? "still reading this page…"
+                                  : "no OCR text on this page yet")
+            return
         }
+        selectAllDoc = false
+        const pages = {}
+        pages[page] = words
+        selectionPages = pages
+        selectionText = ocrText(words)
     }
 
     function clearSelection() {
+        selectAllDoc = false
+        copyAfterAllText = false
         selectionPages = ({})
         selectionText = ""
     }
@@ -657,6 +719,7 @@ Window {
     }
 
     function updateSelection(anchorPage, anchor, focusPage, focus, source) {
+        selectAllDoc = false
         if (source === "ocr" && anchorPage === focusPage && ocrPages[anchorPage]) {
             const characters = ocrCharacters(anchorPage)
             if (characters.length > 0) {
@@ -696,6 +759,8 @@ Window {
     }
 
     function selectionBoxesForPage(page) {
+        if (selectAllDoc && selectionPages["*"] === true)
+            return allDocBoxesForPage(page)
         return selectionPages[page] || []
     }
 
@@ -1109,6 +1174,28 @@ Window {
     }
 
     Connections {
+        target: Doc
+        function onAllTextReady(generation, pages) {
+            if (!root.selectAllDoc || generation !== Doc.generation)
+                return
+            root.selectionText = root.composeAllText(pages)
+            if (root.copyAfterAllText) {
+                root.copyAfterAllText = false
+                root.copyPage()
+            }
+        }
+        function onFileChangedOnDisk() {
+            root.reloadFile(true)
+        }
+    }
+
+    Timer {
+        id: statusClearTimer
+        interval: 4000
+        onTriggered: if (!Ocr.running) root.ocrStatus = ""
+    }
+
+    Connections {
         target: Ocr
         function onFinished(generation, page, text, words, error) {
             if (generation !== root.ocrGeneration)
@@ -1241,6 +1328,44 @@ Window {
                 root.requestOcr(page, false)
             page = -1
         }
+    }
+
+    // Re-read the open file from disk, keeping page, position, zoom and layout.
+    // If the file can't be opened yet (still being written), keep retrying.
+    property string reloadPath: ""
+    property int reloadTries: 0
+    function reloadFile(automatic) {
+        const path = Doc.filePath !== "" ? Doc.filePath : reloadPath
+        if (path === "")
+            return
+        reloadRetry.stop()          // a signal-driven reload supersedes a pending retry
+        reloadPath = path
+        reloadAutomatic = automatic
+        if (pageCount > 0)
+            saveViewState()
+        openFromUrl(path)
+        if (pageCount === 0 && reloadTries < 15) {
+            reloadTries += 1
+            reloadRetry.start()         // open failed: try again shortly
+            return
+        }
+        reloadTries = 0
+        reloadNote.text = automatic ? "file changed \u2014 reloaded" : "reloaded"
+        reloadNote.start()
+    }
+    property bool reloadAutomatic: false
+
+    Timer {
+        id: reloadRetry
+        interval: 1000
+        onTriggered: root.reloadFile(root.reloadAutomatic)
+    }
+
+    Timer {
+        id: reloadNote
+        property string text: ""
+        interval: 350      // openFromUrl clears the status; set ours just after
+        onTriggered: root.setStatus(text)
     }
 
     function openFromUrl(url) {
@@ -1487,7 +1612,7 @@ Window {
                 id: keysButton
                 Layout.preferredWidth: keysLabel.implicitWidth + 24
                 Layout.preferredHeight: 26
-                radius: 6
+                radius: Theme.cornerRadius
                 color: keysMouse.containsMouse || root.showKeys ? Theme.selection : "transparent"
                 border.color: root.showKeys ? Theme.accent : Theme.mutedForeground
                 border.width: 1
@@ -1831,6 +1956,12 @@ Window {
                 }
             }
 
+            TapHandler {
+                acceptedButtons: Qt.RightButton
+                onTapped: (eventPoint) => root.openContextMenu(eventPoint.scenePosition.x,
+                                                               eventPoint.scenePosition.y)
+            }
+
             Timer {
                 id: selectionAutoScroll
                 interval: 16
@@ -1975,6 +2106,138 @@ Window {
     }
 
 
+    // ---------- right-click menu ----------
+    function buildMenu() {
+        const page = Math.max(0, currentPage - 1)
+        const hasPages = pageCount > 0
+        const ocrWords = hasPages && ocrPages[page] ? ocrPages[page].words.length : 0
+        const lastRow = rowFirstPage.length - 1
+        const items = []
+        items.push({ label: selectionText !== "" ? "Copy" : "Copy Page as Image",
+                     shortcut: "Ctrl+C", enabled: hasPages, action: function() { copyPage() } })
+        items.push({ label: "Select All", shortcut: "Ctrl+A", enabled: hasPages,
+                     action: function() { selectAllDocument() } })
+        items.push({ label: "Select All OCR Text", shortcut: "Ctrl+Shift+A", enabled: ocrWords > 0,
+                     action: function() { selectAllOcrOnPage() } })
+        items.push({ separator: true })
+        items.push({ label: "Previous Page", shortcut: "K", enabled: hasPages && currentPage > 1,
+                     action: function() { jumpTo(Math.max(1, currentPage - pagesPerRow), false) } })
+        items.push({ label: "Next Page", shortcut: "J",
+                     enabled: hasPages && rowOf(page) < lastRow,
+                     action: function() { jumpTo(currentPage + pagesPerRow, false) } })
+        items.push({ label: "Back", shortcut: "Ctrl+O", enabled: navBack.length > 0,
+                     action: function() { goBack() } })
+        items.push({ separator: true })
+        items.push({ label: "Reload", shortcut: "Ctrl+R", enabled: hasPages,
+                     action: function() { reloadFile(false) } })
+        items.push({ label: "Open Containing Folder", shortcut: "", enabled: hasPages,
+                     action: function() { Doc.openContainingFolder() } })
+        items.push({ separator: true })
+        items.push({ label: "Fit Width", shortcut: "W", enabled: hasPages, action: function() { fitWidth() } })
+        items.push({ label: "Fit Page", shortcut: "P", enabled: hasPages, action: function() { fitPage() } })
+        items.push({ label: "Actual Size", shortcut: "Ctrl+0", enabled: hasPages,
+                     action: function() { zoom = 1.0 } })
+        items.push({ separator: true })
+        items.push({ label: "Read Text on This Page", shortcut: "Ctrl+Shift+O", enabled: hasPages,
+                     action: function() { recognizeCurrentPage() } })
+        return items
+    }
+
+    function openContextMenu(sceneX, sceneY) {
+        showKeys = false
+        menuItems = buildMenu()
+        let h = 12
+        for (const item of menuItems)
+            h += item.separator ? 9 : 30
+        menuPos = Qt.point(Math.max(4, Math.min(sceneX, width - 288)),
+                           Math.max(header.height + 2, Math.min(sceneY, height - h - 4)))
+        showMenu = true
+    }
+
+    MouseArea {   // click anywhere outside the menu to dismiss it
+        anchors.fill: parent
+        visible: root.showMenu
+        z: 95
+        acceptedButtons: Qt.LeftButton | Qt.RightButton
+        onPressed: root.showMenu = false
+    }
+
+    Rectangle {
+        id: contextMenu
+        visible: root.showMenu
+        z: 100
+        x: root.menuPos.x
+        y: root.menuPos.y
+        width: 280
+        height: menuColumn.implicitHeight + 12
+        radius: Theme.cornerRadius
+        color: Theme.darkerBackground
+        border.color: Theme.mutedForeground
+        border.width: 1
+
+        MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons }   // swallow clicks
+
+        Column {
+            id: menuColumn
+            x: 6
+            y: 6
+            width: parent.width - 12
+            Repeater {
+                model: root.menuItems
+                delegate: Item {
+                    width: menuColumn.width
+                    height: modelData.separator ? 9 : 30
+
+                    Rectangle {      // separator line
+                        visible: !!modelData.separator
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        height: 1
+                        color: Theme.mutedForeground
+                        opacity: 0.35
+                    }
+                    Rectangle {      // row
+                        visible: !modelData.separator
+                        anchors.fill: parent
+                        radius: Math.max(0, Theme.cornerRadius - 4)
+                        color: rowArea.containsMouse && modelData.enabled
+                               ? Theme.selection : "transparent"
+                        Text {
+                            x: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.label || ""
+                            color: modelData.enabled ? Theme.foreground : Theme.mutedForeground
+                            opacity: modelData.enabled ? 1 : 0.55
+                            font.pixelSize: 13
+                            renderType: Text.QtRendering
+                        }
+                        Text {
+                            anchors.right: parent.right
+                            anchors.rightMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: modelData.shortcut || ""
+                            color: Theme.mutedForeground
+                            opacity: modelData.enabled ? 1 : 0.55
+                            font.pixelSize: 12
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            id: rowArea
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            enabled: !!modelData.enabled
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.showMenu = false
+                                modelData.action()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ---------- keybindings panel ----------
     // Each row: keys to show, a plain-language explanation, and (optionally) the
     // action to run when the row is clicked.
@@ -2012,19 +2275,25 @@ Window {
         { title: "Selecting and copying text", items: [
             { keys: ["Drag"], desc: "Select text. This works on scanned pages and screenshots too: Glance reads them in the background as you browse." },
             { keys: ["Double-click", "Triple-click"], desc: "Select a word (or a code identifier) / a whole line." },
-            { keys: ["Ctrl+a"], desc: "Select all the text on this page.", action: function() { root.selectAllOnPage() } },
+            { keys: ["Ctrl+a"], desc: "Select all the text in the whole document, every page. A very long document takes a moment before it can be copied.",
+              action: function() { root.selectAllDocument() } },
+            { keys: ["Ctrl+Shift+a"], desc: "Select only the text read by OCR on this page, such as a screenshot or scan.",
+              action: function() { root.selectAllOcrOnPage() } },
             { keys: ["c", "Ctrl+c"], desc: "Copy the selection, or the page as an image when nothing is selected.",
               action: function() { root.copyPage() } },
             { keys: ["Ctrl+Shift+o"], desc: "Read this page's text right now. Normally automatic.",
               action: function() { root.recognizeCurrentPage() } }
         ] },
         { title: "Mouse and trackpad", items: [
+            { keys: ["Right-click"], desc: "Menu: copy, select all, previous / next page, back, reload, open the file's folder, zoom, read text." },
             { keys: ["Click a link"], desc: "Follow a PDF link. Web links open in your browser." },
             { keys: ["Pinch", "Ctrl+wheel"], desc: "Zoom around the pointer." },
             { keys: ["Space + drag"], desc: "Pan the page." },
             { keys: ["Click the page number"], desc: "Same as pressing :  to go to a page.", action: function() { root.openCommand() } }
         ] },
         { title: "File", items: [
+            { keys: ["Ctrl+r"], desc: "Reload the file from disk and keep your place. Glance also reloads by itself when the file changes on disk (for example after you rebuild a PDF).",
+              action: function() { root.reloadFile(false) } },
             { keys: ["o"], desc: "Open a file.", action: function() { picker.open() } },
             { keys: ["q", "Ctrl+q"], desc: "Quit.", action: function() { Qt.quit() } },
             { keys: ["F1"], desc: "Show or hide this list." }
@@ -2048,7 +2317,7 @@ Window {
         anchors.rightMargin: 8
         width: Math.min(560, parent.width - 16)
         height: Math.min(parent.height - header.height - 20, keysColumn.implicitHeight + 24)
-        radius: 10
+        radius: Theme.cornerRadius
         color: Theme.darkerBackground
         border.color: Theme.mutedForeground
         border.width: 1
@@ -2177,13 +2446,17 @@ Window {
     Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
     Shortcut { sequence: "F1"; onActivated: root.showKeys = !root.showKeys }
     Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
-    Shortcut { sequence: "Ctrl+a"; enabled: !root.typing; onActivated: root.selectAllOnPage() }
+    Shortcut { sequence: "Ctrl+a"; enabled: !root.typing; onActivated: root.selectAllDocument() }
+    Shortcut { sequence: "Ctrl+Shift+a"; enabled: !root.typing; onActivated: root.selectAllOcrOnPage() }
+    Shortcut { sequence: "Ctrl+r"; enabled: !root.typing; onActivated: root.reloadFile(false) }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
                onActivated: root.recognizeCurrentPage() }
     Shortcut { sequence: "Escape"; onActivated: {
         root.vimCount = 0
         root.gPending = false
-        if (root.showKeys)
+        if (root.showMenu)
+            root.showMenu = false
+        else if (root.showKeys)
             root.showKeys = false
         else if (root.cmdActive)
             root.closeCommand()

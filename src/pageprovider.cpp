@@ -17,7 +17,8 @@ struct Request {
     qreal scale = 1.0;
 };
 
-// p<page>_<exp>_<dpr> | t<page>_<dpr>
+// p<page>_<exp>_<dpr>[_<generation>] | t<page>_<dpr>[_<generation>]
+// (the generation only makes the URL unique; it is ignored here)
 Request parseRequest(const QString &id, const Document *doc)
 {
     Request r;
@@ -36,7 +37,7 @@ Request parseRequest(const QString &id, const Document *doc)
 
     r.page = page;
 
-    if (head.startsWith('p') && parts.size() == 3) {
+    if (head.startsWith('p') && (parts.size() == 3 || parts.size() == 4)) {
         bool okExp = false;
         const int exp = parts.at(1).toInt(&okExp);
         const qreal dpr = parts.at(2).toDouble();
@@ -47,7 +48,7 @@ Request parseRequest(const QString &id, const Document *doc)
         const qreal cap = 8192.0 / std::max(1.0, std::max(pts.width(), pts.height()));
         r.scale = std::clamp(std::pow(1.25, exp) * dpr, 0.01, cap);
         r.valid = true;
-    } else if (head.startsWith('t') && parts.size() == 2) {
+    } else if (head.startsWith('t') && (parts.size() == 2 || parts.size() == 3)) {
         const qreal dpr = parts.at(1).toDouble();
         if (dpr <= 0)
             return r;

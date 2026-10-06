@@ -39,7 +39,7 @@ Item {
 
                 Image {
                     anchors.fill: parent
-                    source: "image://pages/t" + index + "_" + Screen.devicePixelRatio
+                    source: "image://pages/t" + index + "_" + Screen.devicePixelRatio + "_" + Doc.generation
                     fillMode: Image.PreserveAspectFit
                     smooth: true
                     cache: true

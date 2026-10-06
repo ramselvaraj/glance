@@ -2,6 +2,8 @@
 
 #include <QDir>
 #include <QFile>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QDebug>
@@ -176,6 +178,19 @@ void Theme::reload()
     if (dir.isEmpty()) {
         qWarning() << "glance: no usable omarchy theme dir found";
         return;
+    }
+
+    // Match the compositor's corner rounding (square on stock Omarchy).
+    {
+        QProcess rounding;
+        rounding.start(QStringLiteral("hyprctl"),
+                       {QStringLiteral("getoption"), QStringLiteral("decoration:rounding"),
+                        QStringLiteral("-j")});
+        if (rounding.waitForFinished(500) && rounding.exitStatus() == QProcess::NormalExit) {
+            const QJsonObject o = QJsonDocument::fromJson(rounding.readAllStandardOutput()).object();
+            if (o.contains(QStringLiteral("int")))
+                m_cornerRadius = qBound(0, o.value(QStringLiteral("int")).toInt(), 24);
+        }
     }
 
     Palette p;

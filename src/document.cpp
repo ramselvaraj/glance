@@ -265,6 +265,18 @@ Document::Document(const QString &path, QObject *parent)
 {
     m_renderPool.setMaxThreadCount(1);
     m_textPool.setMaxThreadCount(1);
+    m_changeTimer.setSingleShot(true);
+    connect(&m_changeTimer, &QTimer::timeout, this, &Document::checkFileChange);
+    connect(&m_fileWatcher, &QFileSystemWatcher::fileChanged, this, [this] {
+        watchFile();                 // a replaced file drops its watch; re-add
+        m_changeRetries = 0;
+        m_changeTimer.start(500);
+    });
+    connect(&m_fileWatcher, &QFileSystemWatcher::directoryChanged, this, [this] {
+        watchFile();
+        m_changeRetries = 0;
+        m_changeTimer.start(500);
+    });
     if (!path.isEmpty())
         load(path);
 }
@@ -276,6 +288,12 @@ Document::~Document()
 
 void Document::reset()
 {
+    m_textAbort = true;
+    m_changeTimer.stop();
+    if (!m_fileWatcher.files().isEmpty())
+        m_fileWatcher.removePaths(m_fileWatcher.files());
+    if (!m_fileWatcher.directories().isEmpty())
+        m_fileWatcher.removePaths(m_fileWatcher.directories());
     m_labels.clear();
     m_labelsBuilt = false;
     m_imageRectCache.clear();
@@ -304,6 +322,116 @@ void Document::reset()
     m_openPath.clear();
 }
 
+bool Document::openContainingFolder() const
+{
+    if (m_path.isEmpty())
+        return false;
+    return QDesktopServices::openUrl(
+        QUrl::fromLocalFile(QFileInfo(m_path).absolutePath()));
+}
+
+void Document::watchFile()
+{
+    if (m_path.isEmpty())
+        return;
+    const QFileInfo info(m_path);
+    // Watch the file and its folder: writers often replace the file (rename),
+    // which silently ends a watch on the old inode.
+    if (info.exists() && !m_fileWatcher.files().contains(m_path))
+        m_fileWatcher.addPath(m_path);
+    const QString dir = info.absolutePath();
+    if (!m_fileWatcher.directories().contains(dir))
+        m_fileWatcher.addPath(dir);
+}
+
+// Is `path` a document we can open right now? A separate MuPDF context so a
+// half-written file can never disturb the document on screen.
+static bool probeReadable(const QString &path)
+{
+    fz_context *ctx = fz_new_context(nullptr, nullptr, FZ_STORE_DEFAULT);
+    if (!ctx)
+        return false;
+    bool ok = false;
+    fz_try(ctx) {
+        fz_register_document_handlers(ctx);
+        fz_document *doc = fz_open_document(ctx, path.toUtf8().constData());
+        ok = doc && fz_count_pages(ctx, doc) > 0;
+        fz_drop_document(ctx, doc);
+    }
+    fz_catch(ctx) {
+        ok = false;
+    }
+    fz_drop_context(ctx);
+    if (!ok) {
+        // Qt also has a PDF "image" plugin; a broken PDF must not count as readable.
+        QImageReader reader(path);
+        return reader.canRead() && reader.format().toLower() != "pdf";
+    }
+    // MuPDF happily "repairs" a truncated PDF, so a file still being written
+    // would pass. A finished PDF ends with %%EOF; wait until it does.
+    if (path.endsWith(QStringLiteral(".pdf"), Qt::CaseInsensitive)) {
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly))
+            return false;
+        f.seek(qMax<qint64>(0, f.size() - 2048));
+        if (!f.readAll().contains("%%EOF"))
+            return false;
+    }
+    return true;
+}
+
+// Debounced: only report a change once size and mtime stop moving (the writer
+// is done) and the file opens; otherwise keep waiting, up to ~15 s.
+void Document::checkFileChange()
+{
+    if (m_path.isEmpty())
+        return;
+    const QFileInfo info(m_path);
+    if (!info.exists()) {
+        if (++m_changeRetries < 30)
+            m_changeTimer.start(500);
+        return;
+    }
+    const qint64 size = info.size();
+    const qint64 mtime = info.lastModified().toMSecsSinceEpoch();
+    if (size == m_loadedSize && mtime == m_loadedMtime)
+        return;                                   // nothing really changed
+    const bool stable = size == m_lastSeenSize && mtime == m_lastSeenMtime;
+    m_lastSeenSize = size;
+    m_lastSeenMtime = mtime;
+    if (stable && size > 0 && probeReadable(m_path)) {
+        emit fileChangedOnDisk();
+        return;
+    }
+    if (++m_changeRetries < 30)
+        m_changeTimer.start(500);
+}
+
+void Document::requestAllText()
+{
+    if (!isOpen())
+        return;
+    const QString path = m_path;
+    const int generation = m_generation;
+    const int pages = m_pageCount;
+    m_textPool.start([this, path, generation, pages] {
+        QStringList texts;
+        texts.reserve(pages);
+        for (int p = 0; p < pages; ++p) {
+            if (m_textAbort || path != m_path)   // document closed or replaced
+                return;
+            const QSizeF size = pageSizePt(p);
+            texts.append(selectText(p, QPointF(0, 0),
+                                    QPointF(size.width(), size.height()))
+                             .value(QStringLiteral("text")).toString());
+        }
+        QMetaObject::invokeMethod(this, [this, generation, texts, path] {
+            if (path == m_path)
+                emit allTextReady(generation, texts);
+        }, Qt::QueuedConnection);
+    });
+}
+
 bool Document::open(const QString &path)
 {
     reset();
@@ -327,7 +455,7 @@ QString convertWithQt(const QString &path)
 {
     QImageReader reader(path);
     reader.setAutoTransform(true);
-    if (!reader.canRead())
+    if (!reader.canRead() || reader.format().toLower() == "pdf")
         return {};
     const QFileInfo info(path);
     const QString key = QString::fromLatin1(QCryptographicHash::hash(
@@ -356,6 +484,8 @@ QString convertWithQt(const QString &path)
 bool Document::load(const QString &path)
 {
     m_path = path;
+    ++m_generation;
+    m_textAbort = false;
 
     m_ctx = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
     if (!m_ctx) {
@@ -405,6 +535,10 @@ bool Document::load(const QString &path)
     }
 
     computeSizes();
+    const QFileInfo info(m_path);
+    m_loadedSize = m_lastSeenSize = info.size();
+    m_loadedMtime = m_lastSeenMtime = info.lastModified().toMSecsSinceEpoch();
+    watchFile();
     return true;
 }
 

@@ -9,6 +9,8 @@
 // its colors.toml, and hot-reloads when themes change underneath us.
 class Theme : public QObject {
     Q_OBJECT
+    // Corner radius of the system (Hyprland decoration:rounding), so popups match.
+    Q_PROPERTY(int cornerRadius READ cornerRadius NOTIFY changed)
     Q_PROPERTY(QColor accent READ accent NOTIFY changed)
     Q_PROPERTY(QColor background READ background NOTIFY changed)
     Q_PROPERTY(QColor darkBackground READ darkBackground NOTIFY changed)
@@ -29,6 +31,8 @@ public:
     explicit Theme(QObject *parent = nullptr);
 
     QColor accent() const { return m_p.accent; }
+
+    int cornerRadius() const { return m_cornerRadius; }
     QColor background() const { return m_p.background; }
     QColor darkBackground() const { return m_p.darkBackground; }
     QColor darkerBackground() const { return m_p.darkerBackground; }
@@ -76,6 +80,7 @@ private:
     void scheduleReload();
 
     Palette m_p;
+    int m_cornerRadius = 6;
     QFileSystemWatcher m_watcher;
     QTimer m_reloadDebounce;
     QString m_currentToml; // watched file (full path)
