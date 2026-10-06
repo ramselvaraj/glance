@@ -1,0 +1,19 @@
+# file<TAB>expected kind<TAB>text (a prefix of the paragraph; "=" prefix means the whole text)
+# Run: scripts/check-reading.py   (PDFs are looked up in $GLANCE_TEST_PDFS, default ~/Downloads)
+3555047.pdf	aside	=24
+3555047.pdf	heading	Machine Learning Based Framework for Fast Resource
+3555047.pdf	body	Field-programmable gate arrays (FPGAs) have grown
+3555047.pdf	body	Modern integrated circuit (IC) designs
+3555047.pdf	header	ML-Based Framework for Fast Resource Estimation
+3555047.pdf	footer	ACM Transactions on Design Automation
+3555047.pdf	reference	=REFERENCES
+3555047.pdf	reference	[1] OpenCores. 1999.
+3555047.pdf	caption	Table 1. Post-Implementation Resource Usages
+08_Efficient Design.pdf	heading	Timing Optimizations
+08_Efficient Design.pdf	pagenum	=10
+09_Floating Point Formats and Designs_Prashant.pdf	math	bias = 2
+09_Floating Point Formats and Designs_Prashant.pdf	body	• Sign bit: 0 for positive
+3555047.pdf	table	Feature description LUT FF BRAM
+3555047.pdf	table	Design #LUT #FF #BRAM
+3555047.pdf	table	Design Static Elaboration(s)
+3555047.pdf	caption	Table 8. Runtime of Static Elaboration, RTL Elaboration, and Vivado Synthesis

@@ -1,4 +1,5 @@
 #include "document.h"
+#include "readingtext.h"
 
 #include <QFileInfo>
 #include <QThreadPool>
@@ -897,6 +898,49 @@ QImage Document::renderPage(int page, qreal scale) const
     return copy;
 }
 
+// A crop of a page, in page points relative to the page origin, at `scale`.
+QImage Document::renderRegion(int page, qreal scale, const QRectF &region) const
+{
+    if (!isOpen() || scale <= 0 || page < 0 || page >= m_pageCount || region.isEmpty())
+        return QImage();
+    const int w = std::clamp(int(std::ceil(region.width() * scale)), 1, 8192);
+    const int h = std::clamp(int(std::ceil(region.height() * scale)), 1, 8192);
+
+    QMutexLocker lock(&m_mutex);
+    fz_pixmap *pix = nullptr;
+    fz_device *dev = nullptr;
+    fz_page *fzPage = nullptr;
+    QImage copy;
+    fz_var(pix);
+    fz_var(dev);
+    fz_var(fzPage);
+    fz_try(m_ctx) {
+        const QPointF origin = m_origins.at(page);
+        fz_matrix ctm = fz_concat(fz_translate(-float(origin.x() + region.x()),
+                                               -float(origin.y() + region.y())),
+                                  fz_scale(scale, scale));
+        fzPage = fz_load_page(m_ctx, m_doc, page);
+        pix = fz_new_pixmap_with_bbox(m_ctx, fz_device_rgb(m_ctx), fz_make_irect(0, 0, w, h), nullptr, 0);
+        fz_clear_pixmap_with_value(m_ctx, pix, 0xff);
+        dev = fz_new_draw_device(m_ctx, fz_identity, pix);
+        fz_run_page(m_ctx, fzPage, dev, ctm, nullptr);
+        fz_close_device(m_ctx, dev);
+        QImage img(pix->samples, pix->w, pix->h, static_cast<qsizetype>(pix->stride),
+                   QImage::Format_RGB888);
+        copy = img.copy();
+    }
+    fz_always(m_ctx) {
+        fz_drop_device(m_ctx, dev);
+        fz_drop_pixmap(m_ctx, pix);
+        fz_drop_page(m_ctx, fzPage);
+    }
+    fz_catch(m_ctx) {
+        qWarning() << "glance: region render failed on page" << page;
+        return QImage();
+    }
+    return copy;
+}
+
 void Document::prefetch(int page, qreal scale) const
 {
     if (!isOpen())
@@ -1304,6 +1348,365 @@ fz_stext_page *Document::textPage(int pageNumber) const
         m_ctx, m_doc, pageNumber, nullptr);
     m_textPages.insert(pageNumber, page);
     return page;
+}
+
+namespace {
+
+// What kind of content a PDF structure element declares, or `inherited` when it
+// only groups (document, section, paragraph, span...).
+QString tagForStructure(fz_structure type, const QString &inherited)
+{
+    switch (type) {
+    case FZ_STRUCTURE_ARTIFACT: return QStringLiteral("artifact");
+    case FZ_STRUCTURE_FIGURE: return QStringLiteral("figure");
+    case FZ_STRUCTURE_FORMULA: return QStringLiteral("formula");
+    case FZ_STRUCTURE_TABLE: case FZ_STRUCTURE_TR: case FZ_STRUCTURE_TH: case FZ_STRUCTURE_TD:
+    case FZ_STRUCTURE_THEAD: case FZ_STRUCTURE_TBODY: case FZ_STRUCTURE_TFOOT:
+        return QStringLiteral("table");
+    case FZ_STRUCTURE_CAPTION: return QStringLiteral("caption");
+    case FZ_STRUCTURE_FENOTE: case FZ_STRUCTURE_NOTE: return QStringLiteral("footnote");
+    case FZ_STRUCTURE_REFERENCE: case FZ_STRUCTURE_BIBENTRY: return QStringLiteral("reference");
+    case FZ_STRUCTURE_TOC: case FZ_STRUCTURE_TOCI: case FZ_STRUCTURE_INDEX:
+        return QStringLiteral("toc");
+    case FZ_STRUCTURE_H: case FZ_STRUCTURE_H1: case FZ_STRUCTURE_H2: case FZ_STRUCTURE_H3:
+    case FZ_STRUCTURE_H4: case FZ_STRUCTURE_H5: case FZ_STRUCTURE_H6: case FZ_STRUCTURE_TITLE:
+        return QStringLiteral("heading");
+    default:
+        return inherited;
+    }
+}
+
+bool isMathFont(const char *name)
+{
+    if (!name)
+        return false;
+    static const char *const markers[] = {
+        "cmmi", "cmsy", "cmex", "msbm", "msam", "eufm", "rtxmi", "rtxsy", "txmi", "txsy",
+        "mtsy", "mtmi", "mtextra", "stixmath", "cambriamath", "lmmath", "xitsmath",
+        "pxmi", "pxsy", "mathematicalpi", "symbolmt", "mathit", "eusm", "lmmi", "lmsy"};
+    const QByteArray lower = QByteArray(name).toLower();
+    for (const char *m : markers)
+        if (lower.contains(m))
+            return true;
+    return false;
+}
+
+// Collects a page's text lines (with the PDF's own structure tags and the
+// extent of every character) and its pictures.
+struct ReadCollector {
+    fz_context *ctx;
+    QPointF origin;
+    QVector<ReadLine> *lines;
+    QVector<QRectF> images;
+    QVector<QRectF> grids;     // tables as MuPDF's own table finder sees them
+
+    void walk(fz_stext_block *first, const QString &tag, bool tagged)
+    {
+        for (fz_stext_block *block = first; block; block = block->next) {
+            if (block->type == FZ_STEXT_BLOCK_STRUCT) {
+                fz_stext_struct *node = block->u.s.down;
+                if (node)
+                    walk(node->first_block, tagForStructure(node->standard, tag), true);
+            } else if (block->type == FZ_STEXT_BLOCK_GRID) {
+                grids.append(QRectF(block->bbox.x0 - origin.x(), block->bbox.y0 - origin.y(),
+                                    block->bbox.x1 - block->bbox.x0, block->bbox.y1 - block->bbox.y0));
+            } else if (block->type == FZ_STEXT_BLOCK_IMAGE) {
+                images.append(QRectF(block->bbox.x0 - origin.x(), block->bbox.y0 - origin.y(),
+                                     block->bbox.x1 - block->bbox.x0, block->bbox.y1 - block->bbox.y0));
+            } else if (block->type == FZ_STEXT_BLOCK_TEXT) {
+                for (fz_stext_line *line = block->u.t.first_line; line; line = line->next)
+                    addLine(block, line, tag, tagged);
+            }
+        }
+    }
+
+    void addLine(fz_stext_block *block, fz_stext_line *line, const QString &tag, bool tagged)
+    {
+        // Rotated lines are watermarks and margin stamps.
+        if (!line->first_char || std::abs(line->dir.y) > 0.1f || line->dir.x <= 0)
+            return;
+        float maxSize = 0;
+        int boldChars = 0, mathChars = 0, chars = 0;
+        for (fz_stext_char *ch = line->first_char; ch; ch = ch->next) {
+            maxSize = std::max(maxSize, ch->size);
+            ++chars;
+            if (ch->flags & FZ_STEXT_BOLD)
+                ++boldChars;
+            if (ch->font && isMathFont(fz_font_name(ctx, ch->font)))
+                ++mathChars;
+        }
+        // The text is built already normalized (ligatures expanded, whitespace
+        // collapsed) with the extent of every character, so a position in the
+        // text maps back to a place on the page.
+        QString s;
+        QVector<float> cx0, cx1;
+        bool first = true;
+        for (fz_stext_char *ch = line->first_char; ch; ch = ch->next) {
+            // Drop superscript footnote markers and citation numbers.
+            const bool sup = !first && ch->size < maxSize * 0.75f
+                && (QChar::isDigit(uint(ch->c)) || ch->c == '*'
+                    || ch->c == 0x2020 || ch->c == 0x2021 || ch->c == ',');
+            first = false;
+            if (sup)
+                continue;
+            const char32_t code = char32_t(ch->c);
+            const QString piece = QString::fromUcs4(&code, 1).normalized(QString::NormalizationForm_KC);
+            const float a = std::min(ch->quad.ul.x, ch->quad.ll.x) - float(origin.x());
+            const float b = std::max(ch->quad.ur.x, ch->quad.lr.x) - float(origin.x());
+            const float step = (b - a) / std::max<qsizetype>(1, piece.size());
+            for (qsizetype k = 0; k < piece.size(); ++k) {
+                if (piece[k].isSpace()) {
+                    if (!s.isEmpty() && !s.endsWith(QLatin1Char(' '))) {
+                        s += QLatin1Char(' ');
+                        cx0.append(a + step * k);
+                        cx1.append(a + step * (k + 1));
+                    }
+                } else {
+                    s += piece[k];
+                    cx0.append(a + step * k);
+                    cx1.append(a + step * (k + 1));
+                }
+            }
+        }
+        while (s.endsWith(QLatin1Char(' '))) {
+            s.chop(1);
+            cx0.removeLast();
+            cx1.removeLast();
+        }
+        ReadLine rl;
+        rl.box = QRectF(line->bbox.x0 - origin.x(), line->bbox.y0 - origin.y(),
+                        line->bbox.x1 - line->bbox.x0, line->bbox.y1 - line->bbox.y0);
+        rl.size = maxSize;
+        rl.bold = chars > 0 && boldChars * 2 > chars;
+        rl.block = block->id;
+        rl.text = s;
+        rl.cx0 = cx0;
+        rl.cx1 = cx1;
+        rl.tag = tag;
+        rl.tagged = tagged;
+        rl.mathFraction = chars > 0 ? double(mathChars) / chars : 0.0;
+        if (qEnvironmentVariableIsSet("GLANCE_READ_TAGS"))
+            fprintf(stderr, "tag %-9s %s %s\n", rl.tag.toUtf8().constData(), tagged ? "T" : "-",
+                    rl.text.left(60).toUtf8().constData());
+        lines->push_back(rl);
+    }
+
+    // Structure elements and font changes split a row into several lines (an
+    // inline variable, a subscript). Put pieces that share a row back together.
+    void mergeSameRow()
+    {
+        QVector<ReadLine> out;
+        for (ReadLine &l : *lines) {
+            if (!out.isEmpty()) {
+                ReadLine &p = out.last();
+                const double overlap = std::min(p.box.bottom(), l.box.bottom()) - std::max(p.box.top(), l.box.top());
+                const double gap = l.box.left() - p.box.right();
+                const double reach = std::max(p.size, l.size);
+                if (overlap > 0.6 * std::min(p.box.height(), l.box.height())
+                    && gap > -2 && gap < reach * 1.2 && !p.text.isEmpty() && !l.text.isEmpty()) {
+                    const bool space = gap > reach * 0.15;
+                    if (space) {
+                        p.text += QLatin1Char(' ');
+                        p.cx0.append(float(p.box.right()));
+                        p.cx1.append(float(l.box.left()));
+                    }
+                    const int pn = p.text.size();
+                    p.text += l.text;
+                    p.cx0 += l.cx0;
+                    p.cx1 += l.cx1;
+                    Q_UNUSED(pn);
+                    const double total = double(p.text.size());
+                    const double lw = double(l.text.size());
+                    p.mathFraction = (p.mathFraction * (total - lw) + l.mathFraction * lw) / std::max(1.0, total);
+                    if (l.text.size() > p.text.size() - l.text.size()) {
+                        p.tag = l.tag;
+                        p.tagged = l.tagged;
+                    }
+                    p.box = p.box.united(l.box);
+                    p.size = std::max(p.size, l.size);
+                    p.bold = p.bold && l.bold;
+                    continue;
+                }
+            }
+            out.append(l);
+        }
+        *lines = out;
+    }
+
+    // Only grids that look like tables: not a page-sized frame (slide backgrounds,
+    // page borders) and holding several lines of text.
+    void markGrids(QSizeF pageSize)
+    {
+        for (const QRectF &g : std::as_const(grids)) {
+            if (g.width() * g.height() > 0.6 * pageSize.width() * pageSize.height())
+                continue;
+            const QRectF area = g.adjusted(-2, -2, 2, 2);
+            int inside = 0;
+            for (const ReadLine &l : *lines)
+                if (area.contains(l.box.center()))
+                    ++inside;
+            if (inside < 4)
+                continue;
+            for (ReadLine &l : *lines)
+                if (area.contains(l.box.center()))
+                    l.inGrid = true;
+        }
+    }
+
+    // Share of each line lying over a picture. Full-page images are scans or
+    // backgrounds, not figures.
+    void markPictures(QSizeF pageSize)
+    {
+        QVector<QRectF> figures;
+        for (const QRectF &r : std::as_const(images))
+            if (r.width() * r.height() < 0.7 * pageSize.width() * pageSize.height())
+                figures.append(r);
+        if (figures.isEmpty())
+            return;
+        for (ReadLine &l : *lines) {
+            const double area = std::max(1.0, l.box.width() * l.box.height());
+            double best = 0;
+            for (const QRectF &r : std::as_const(figures)) {
+                const QRectF i = l.box.intersected(r);
+                if (!i.isEmpty())
+                    best = std::max(best, i.width() * i.height() / area);
+            }
+            l.imageFraction = best;
+        }
+    }
+};
+
+} // namespace
+
+QVariantList Document::readingParagraphs(const QVariantMap &options) const
+{
+    QVariantList result;
+    if (!isOpen())
+        return result;
+
+    ReadOptions opts;
+    const auto flag = [&](const char *key, bool fallback) {
+        return options.contains(QLatin1String(key)) ? options.value(QLatin1String(key)).toBool()
+                                                    : fallback;
+    };
+    opts.skipHeadersFooters = flag("skipHeadersFooters", opts.skipHeadersFooters);
+    opts.skipFootnotes = flag("skipFootnotes", opts.skipFootnotes);
+    opts.skipCaptions = flag("skipCaptions", opts.skipCaptions);
+    opts.skipTables = flag("skipTables", opts.skipTables);
+    opts.skipReferences = flag("skipReferences", opts.skipReferences);
+
+    opts.skipMath = flag("skipMath", opts.skipMath);
+
+    QVector<QVector<ReadLine>> pages(m_pageCount);
+    QVector<QSizeF> sizes(m_pageCount);
+    {
+        QMutexLocker lock(&m_mutex);
+        for (int p = 0; p < m_pageCount; ++p) {
+            sizes[p] = m_sizes.at(p);
+            const QPointF origin = m_origins.at(p);
+            fz_stext_page *text = nullptr;
+            fz_try(m_ctx) {
+                fz_stext_options sopts{};
+                sopts.flags = FZ_STEXT_COLLECT_STRUCTURE | FZ_STEXT_PRESERVE_IMAGES | FZ_STEXT_TABLE_HUNT;
+                text = fz_new_stext_page_from_page_number(m_ctx, m_doc, p, &sopts);
+                ReadCollector collector{m_ctx, origin, &pages[p], {}};
+                collector.walk(text->first_block, QString(), false);
+                collector.mergeSameRow();
+                collector.markPictures(sizes[p]);
+                collector.markGrids(sizes[p]);
+            }
+            fz_always(m_ctx) {
+                fz_drop_stext_page(m_ctx, text);
+            }
+            fz_catch(m_ctx) {
+                qWarning() << "glance: reading text failed on page" << p;
+            }
+        }
+    }
+
+    const QVector<ReadParagraph> built = buildReadingParagraphs(pages, sizes, opts, ReadModel::load());
+    {
+        QMutexLocker lock(&m_readMutex);
+        m_readCache = built;
+    }
+    for (const ReadParagraph &para : built) {
+        QVariantList featureList;
+        for (double v : para.features)
+            featureList.append(v);
+        QVariantList boxes;
+        for (const ReadBox &b : para.boxes)
+            boxes.append(QVariantMap{{QStringLiteral("page"), b.page},
+                                     {QStringLiteral("x"), b.rect.x()}, {QStringLiteral("y"), b.rect.y()},
+                                     {QStringLiteral("w"), b.rect.width()}, {QStringLiteral("h"), b.rect.height()},
+                                     {QStringLiteral("start"), b.start}, {QStringLiteral("end"), b.end}});
+        result.append(QVariantMap{{QStringLiteral("page"), para.page},
+                                  {QStringLiteral("text"), para.text},
+                                  {QStringLiteral("kind"), para.kind},
+                                  {QStringLiteral("skipped"), para.skipped},
+                                  {QStringLiteral("boxes"), boxes},
+                                  {QStringLiteral("features"), featureList}});
+    }
+    return result;
+}
+
+// Where a character offset of a paragraph (as returned by readingParagraphs,
+// addressed by its position in that list) sits on the page: the word around it
+// and the line it is on, in page points.
+QVariantMap Document::readingWordAt(int paragraph, int offset) const
+{
+    QMutexLocker lock(&m_readMutex);
+    if (paragraph < 0 || paragraph >= m_readCache.size())
+        return {};
+    const ReadParagraph &para = m_readCache.at(paragraph);
+    const QString &text = para.text;
+    if (text.isEmpty() || para.boxes.isEmpty())
+        return {};
+    offset = std::clamp(offset, 0, int(text.size()) - 1);
+    while (offset < text.size() - 1 && text[offset].isSpace())
+        ++offset;
+    int ws = offset, we = offset;
+    while (ws > 0 && !text[ws - 1].isSpace())
+        --ws;
+    while (we < text.size() && !text[we].isSpace())
+        ++we;
+
+    int bi = 0;
+    for (int i = 0; i < para.boxes.size(); ++i)
+        if (para.boxes[i].start <= offset)
+            bi = i;
+    const ReadBox &b = para.boxes[bi];
+    const int n = std::min<int>(b.cx0.size(), b.cx1.size());
+    if (n == 0)
+        return {};
+    const int from = std::clamp(ws - b.start, 0, n - 1);
+    const int to = std::clamp(we - b.start - 1, from, n - 1);
+    const double x0 = b.cx0[from];
+    const double x1 = b.cx1[to];
+    return QVariantMap{{QStringLiteral("page"), b.page},
+                       {QStringLiteral("x"), x0}, {QStringLiteral("y"), b.rect.y()},
+                       {QStringLiteral("w"), std::max(1.0, x1 - x0)}, {QStringLiteral("h"), b.rect.height()},
+                       {QStringLiteral("wordStart"), ws}, {QStringLiteral("wordEnd"), we},
+                       {QStringLiteral("lineX"), b.rect.x()}, {QStringLiteral("lineW"), b.rect.width()},
+                       {QStringLiteral("line"), bi}};
+}
+
+void Document::teachReading(const QVariantList &features, bool junk) const
+{
+    QVector<double> f;
+    for (const QVariant &v : features)
+        f.append(v.toDouble());
+    if (f.size() != ReadModel::kFeatures)
+        return;
+    ReadModel model = ReadModel::load();
+    model.learn(f, junk);
+    model.save();
+}
+
+void Document::resetReadingModel() const
+{
+    ReadModel model = ReadModel::load();
+    model.reset();
+    model.save();
 }
 
 bool Document::copyTextToClipboard(const QString &text) const

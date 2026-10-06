@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include "readingtext.h"
 #include <QString>
 #include <QSizeF>
 #include <QPointF>
@@ -84,6 +85,7 @@ public:
     // Renders page at 1.0 = natural PDF size (one point per pixel); callers
     // factor in devicePixelRatio. Thread-safe, serialized.
     QImage renderPage(int page, qreal scale) const;
+    QImage renderRegion(int page, qreal scale, const QRectF &region) const;
     QThreadPool *renderPool() const { return &m_renderPool; }
 
     // Worker-thread warm-up: renders then discards so MuPDF's store has the
@@ -108,6 +110,21 @@ public:
     Q_INVOKABLE QVariantMap selectTextRange(int anchorPage, QPointF anchor,
                                             int focusPage, QPointF focus) const;
     Q_INVOKABLE bool copyTextToClipboard(const QString &text) const;
+
+    // Read-aloud text: the whole document as paragraphs in reading order, each
+    // {page, text, kind, skipped, boxes:[{page,x,y,w,h}]}. `kind` is body,
+    // heading, header, footer, pagenum, footnote, caption, table or reference;
+    // `skipped` says whether the options exclude it. Options (all bool):
+    // skipHeadersFooters, skipFootnotes, skipCaptions, skipTables,
+    // skipReferences. Only native text is read; scanned pages yield nothing.
+    Q_INVOKABLE QVariantList readingParagraphs(const QVariantMap &options) const;
+    // The user said a paragraph (given by its feature vector) is junk or main text:
+    // the line classifier learns from it and remembers across sessions.
+    // The word at a character offset of paragraph `paragraph` (index into the last
+    // readingParagraphs result), with its line, in page points.
+    Q_INVOKABLE QVariantMap readingWordAt(int paragraph, int offset) const;
+    Q_INVOKABLE void teachReading(const QVariantList &features, bool junk) const;
+    Q_INVOKABLE void resetReadingModel() const;
 
     // Renders the page at 2x and puts it on the system clipboard.
     Q_INVOKABLE bool copyPageToClipboard(int page) const;
@@ -159,6 +176,8 @@ private:
     QVector<QPointF> m_origins;
     mutable QHash<int, fz_stext_page *> m_textPages;
     mutable QMutex m_mutex;
+    mutable QMutex m_readMutex;
+    mutable QVector<ReadParagraph> m_readCache;
     mutable QThreadPool m_renderPool;
     QThreadPool m_textPool;
     std::atomic<int> m_searchGeneration{0};

@@ -15,6 +15,8 @@ struct Request {
     bool valid = false;
     int page = -1;
     qreal scale = 1.0;
+    bool region = false;
+    QRectF rect;
 };
 
 // p<page>_<exp>_<dpr>[_<generation>] | t<page>_<dpr>[_<generation>]
@@ -48,6 +50,13 @@ Request parseRequest(const QString &id, const Document *doc)
         const qreal cap = 8192.0 / std::max(1.0, std::max(pts.width(), pts.height()));
         r.scale = std::clamp(std::pow(1.25, exp) * dpr, 0.01, cap);
         r.valid = true;
+    } else if (head.startsWith('r') && parts.size() >= 6) {
+        // r<page>_<scale>_<x>_<y>_<w>_<h>: a crop at the given pixels-per-point
+        r.scale = std::clamp(parts.at(1).toDouble(), 0.05, 16.0);
+        r.rect = QRectF(parts.at(2).toDouble(), parts.at(3).toDouble(),
+                        parts.at(4).toDouble(), parts.at(5).toDouble());
+        r.region = true;
+        r.valid = r.rect.width() > 0 && r.rect.height() > 0;
     } else if (head.startsWith('t') && (parts.size() == 2 || parts.size() == 3)) {
         const qreal dpr = parts.at(1).toDouble();
         if (dpr <= 0)
@@ -64,14 +73,15 @@ Request parseRequest(const QString &id, const Document *doc)
 class RenderRunnable : public QObject, public QRunnable {
     Q_OBJECT
 public:
-    RenderRunnable(const Document *doc, int page, qreal scale)
-        : m_doc(doc), m_page(page), m_scale(scale)
+    RenderRunnable(const Document *doc, int page, qreal scale, bool region, QRectF rect)
+        : m_doc(doc), m_page(page), m_scale(scale), m_region(region), m_rect(rect)
     {
     }
 
     void run() override
     {
-        emit done(m_doc->renderPage(m_page, m_scale));
+        emit done(m_region ? m_doc->renderRegion(m_page, m_scale, m_rect)
+                           : m_doc->renderPage(m_page, m_scale));
     }
 
 signals:
@@ -81,14 +91,17 @@ private:
     const Document *m_doc;
     int m_page;
     qreal m_scale;
+    bool m_region;
+    QRectF m_rect;
 };
 
 // Lives on the GUI thread for as long as the engine needs it; engine deletes.
 class PageResponse : public QQuickImageResponse {
 public:
-    PageResponse(const Document *doc, int page, qreal scale, QThreadPool *pool)
+    PageResponse(const Document *doc, int page, qreal scale, QThreadPool *pool,
+                 bool region = false, QRectF rect = QRectF())
     {
-        auto *runnable = new RenderRunnable(doc, page, scale);
+        auto *runnable = new RenderRunnable(doc, page, scale, region, rect);
         connect(runnable, &RenderRunnable::done, this, [this](const QImage &img) {
             m_image = img;
             emit finished();
@@ -118,7 +131,7 @@ QQuickImageResponse *PageProvider::requestImageResponse(const QString &id,
     if (!r.valid || r.page < 0 || r.page >= m_doc->pageCount())
         return new PageResponse(m_doc, -1, 0.0, m_doc->renderPool());
 
-    return new PageResponse(m_doc, r.page, r.scale, m_doc->renderPool());
+    return new PageResponse(m_doc, r.page, r.scale, m_doc->renderPool(), r.region, r.rect);
 }
 
 #include "pageprovider.moc"

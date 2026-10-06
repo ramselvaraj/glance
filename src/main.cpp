@@ -58,6 +58,9 @@ int main(int argc, char *argv[])
                                    QStringLiteral("Double-click word at: page,x,y"),
                                    QStringLiteral("spec"));
     parser.addOption(wordSelfOpt);
+    QCommandLineOption readSelfOpt(QStringLiteral("read-selftest"),
+                                   QStringLiteral("Print read-aloud paragraphs and exit"));
+    parser.addOption(readSelfOpt);
     parser.addPositionalArgument("file", "Document to open (pdf/images). Optional.");
     parser.process(app);
 
@@ -207,6 +210,25 @@ int main(int argc, char *argv[])
         fprintf(stderr, "select-selftest: boxes=%d y=%.1f..%.1f text=[%s]\n",
                 int(r.value("boxes").toList().size()), minY, maxY,
                 r.value("text").toString().toUtf8().constData());
+        return 0;
+    }
+
+    if (parser.isSet(readSelfOpt)) {
+        if (!doc->isOpen())
+            return 1;
+        for (const QVariant &v : doc->readingParagraphs({})) {
+            const QVariantMap m = v.toMap();
+            if (qEnvironmentVariableIsSet("GLANCE_READ_DEBUG") && m.value("kind").toString() == "aside") {
+                QStringList f;
+                for (const QVariant &x : m.value("features").toList())
+                    f << QString::number(x.toDouble(), 'f', 2);
+                printf("   features: %s\n", f.join(' ').toUtf8().constData());
+            }
+            printf("p%d %-9s%s %s\n", m.value("page").toInt() + 1,
+                   m.value("kind").toString().toUtf8().constData(),
+                   m.value("skipped").toBool() ? " [skip]" : "       ",
+                   m.value("text").toString().left(110).toUtf8().constData());
+        }
         return 0;
     }
 

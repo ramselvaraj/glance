@@ -23,6 +23,7 @@ endif()
 qt_add_executable(glance
     src/main.cpp
     src/document.cpp
+    src/readingtext.cpp
     src/pageprovider.cpp
     src/ocrmanager.cpp
     src/inputstate.cpp
