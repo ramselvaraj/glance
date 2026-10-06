@@ -25,6 +25,7 @@ qt_add_executable(glance
     src/document.cpp
     src/readingtext.cpp
     src/reader.cpp
+    src/features.cpp
     src/pageprovider.cpp
     src/ocrmanager.cpp
     src/inputstate.cpp

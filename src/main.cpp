@@ -15,6 +15,7 @@
 #include "pageprovider.h"
 #include "ocrmanager.h"
 #include "reader.h"
+#include "features.h"
 #include "inputstate.h"
 #include "theme.h"
 #include <QThread>
@@ -415,7 +416,12 @@ int main(int argc, char *argv[])
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("Doc", doc);
     engine.rootContext()->setContextProperty("Ocr", &ocr);
+    Features features;
     Reader reader;
+    reader.setEnabled(features.ai());
+    QObject::connect(&features, &Features::aiChanged, &reader,
+                     [&features, &reader] { reader.setEnabled(features.ai()); });
+    engine.rootContext()->setContextProperty("Features", &features);
     engine.rootContext()->setContextProperty("Reader", &reader);
     engine.rootContext()->setContextProperty("Input", &input);
     engine.rootContext()->setContextProperty("InitialWindowWidth", initialWidth);
