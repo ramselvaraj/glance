@@ -26,6 +26,11 @@ class Theme : public QObject {
     Q_PROPERTY(QColor blue READ blue NOTIFY changed)
     Q_PROPERTY(QColor magenta READ magenta NOTIFY changed)
     Q_PROPERTY(bool darkMode READ darkMode NOTIFY changed)
+    // "PDF theme": recolor pages to the system theme and let the window go
+    // translucent so the compositor's blur shows through. Off = untouched PDF.
+    Q_PROPERTY(bool pdfTheme READ pdfTheme WRITE setPdfTheme NOTIFY pdfThemeChanged)
+    // How opaque the translucent surfaces are in PDF theme (0.4 - 1.0).
+    Q_PROPERTY(qreal pdfOpacity READ pdfOpacity WRITE setPdfOpacity NOTIFY pdfThemeChanged)
 
 public:
     explicit Theme(QObject *parent = nullptr);
@@ -48,8 +53,14 @@ public:
     QColor magenta() const { return m_p.magenta; }
     bool darkMode() const { return m_p.darkMode; }
 
+    bool pdfTheme() const { return m_pdfTheme; }
+    void setPdfTheme(bool on);
+    qreal pdfOpacity() const { return m_pdfOpacity; }
+    void setPdfOpacity(qreal v);
+
 signals:
     void changed();
+    void pdfThemeChanged();
 
 private slots:
     void reload();       // re-resolve active theme + repaint (debounced)
@@ -81,6 +92,8 @@ private:
 
     Palette m_p;
     int m_cornerRadius = 6;
+    bool m_pdfTheme = false;
+    qreal m_pdfOpacity = 0.88;
     QFileSystemWatcher m_watcher;
     QTimer m_reloadDebounce;
     QString m_currentToml; // watched file (full path)

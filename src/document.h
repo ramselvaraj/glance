@@ -62,7 +62,7 @@ public:
     Q_INVOKABLE bool pageHasText(int page) const;
     // Everything the viewer needs to decide about OCR and highlighting a page,
     // computed on a worker thread so the GUI never waits on the MuPDF lock:
-    // {hasText, hasImages, chars, boxes, imageRects}. cachedPageInfo() returns an
+    // {hasText, hasImages, chars, boxes, imageRects, colorRects}. cachedPageInfo() returns an
     // empty map until requestPageInfo() has finished (pageInfoReady(page)).
     Q_INVOKABLE QVariantMap cachedPageInfo(int page) const;
     Q_INVOKABLE void requestPageInfo(int page);
@@ -75,6 +75,9 @@ public:
     // Embedded images big enough to hold readable text, as page-point rects
     // [{x,y,w,h}] (largest first, at most 6, slightly padded). Cached.
     Q_INVOKABLE QVariantList pageImageRects(int page) const;
+    // Pictures on a page that PDF theme should leave in their own colours
+    // (tight boxes, small ones included; full-page scans excluded).
+    QVariantList pageColorRects(int page) const;
 
     // Printed page label ("iv", "40") as defined by the PDF; the plain 1-based
     // number when the document defines none. Thread-safe.
@@ -197,6 +200,7 @@ private:
     int m_pageCount = 0;
     QVector<QSizeF> m_sizes;
     QVector<QPointF> m_origins;
+    mutable QHash<int, QVariantList> m_colorRectCache;
     mutable QHash<int, fz_stext_page *> m_textPages;
     mutable QMutex m_mutex;
     mutable QMutex m_readMutex;

@@ -121,7 +121,9 @@ Window {
     readonly property real pageTopPadding: 12
     readonly property real pageBottomPadding: 16
 
-    color: Theme.background
+    color: Theme.pdfTheme ? Qt.rgba(Theme.background.r, Theme.background.g,
+                                    Theme.background.b, Theme.pdfOpacity)
+                          : Theme.background
     title: fileName !== "" ? fileName + " — glance" : "glance"
     width: InitialWindowWidth
     height: InitialWindowHeight
@@ -2959,7 +2961,12 @@ Window {
             anchors.margins: 6
             clip: true
 
-            Rectangle { anchors.fill: parent; color: "white"; radius: Math.max(0, lens.radius - 6) }
+            readonly property bool themed: Theme.pdfTheme
+            Rectangle {
+                anchors.fill: parent
+                color: lensView.themed ? Theme.background : "white"
+                radius: Math.max(0, lens.radius - 6)
+            }
 
             Image {
                 id: bandImage
@@ -2969,6 +2976,16 @@ Window {
                 cache: false
                 smooth: true
                 fillMode: Image.Stretch
+                // Same recolor as the pages, so the lens matches PDF theme
+                // (opaque here: the lens panel itself is solid).
+                layer.enabled: lensView.themed
+                layer.effect: ShaderEffect {
+                    property color lightColor: Theme.background
+                    property color darkColor: Theme.foreground
+                    property real keepHue: 1.0
+                    property real paperAlpha: 1.0
+                    fragmentShader: "qrc:/shaders/recolor.frag.qsb"
+                }
                 width: root.lensBand.w * root.lensZ
                 height: root.lensBand.h * root.lensZ
                 // Keep the current word under the lens centre; the line slides past.
@@ -2998,8 +3015,8 @@ Window {
                 height: parent.height
                 gradient: Gradient {
                     orientation: Gradient.Horizontal
-                    GradientStop { position: 0.0; color: "#ccffffff" }
-                    GradientStop { position: 1.0; color: "#00ffffff" }
+                    GradientStop { position: 0.0; color: lensView.themed ? Qt.rgba(Theme.background.r, Theme.background.g, Theme.background.b, 0.8) : "#ccffffff" }
+                    GradientStop { position: 1.0; color: lensView.themed ? Qt.rgba(Theme.background.r, Theme.background.g, Theme.background.b, 0) : "#00ffffff" }
                 }
             }
             Rectangle {
@@ -3008,8 +3025,8 @@ Window {
                 height: parent.height
                 gradient: Gradient {
                     orientation: Gradient.Horizontal
-                    GradientStop { position: 0.0; color: "#00ffffff" }
-                    GradientStop { position: 1.0; color: "#ccffffff" }
+                    GradientStop { position: 0.0; color: lensView.themed ? Qt.rgba(Theme.background.r, Theme.background.g, Theme.background.b, 0) : "#00ffffff" }
+                    GradientStop { position: 1.0; color: lensView.themed ? Qt.rgba(Theme.background.r, Theme.background.g, Theme.background.b, 0.8) : "#ccffffff" }
                 }
             }
         }
@@ -3427,6 +3444,128 @@ Window {
 
             Item {
                 width: parent.width
+                height: ptText.implicitHeight
+
+                Column {
+                    id: ptText
+                    anchors.left: parent.left
+                    anchors.right: ptSwitch.left
+                    anchors.rightMargin: 16
+                    spacing: 5
+                    Text {
+                        text: "PDF theme"
+                        color: Theme.foreground
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        renderType: Text.QtRendering
+                    }
+                    Text {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        text: "Off shows the PDF exactly as it was made. On recolors pages to your system theme and makes the window translucent so your desktop blur shows through. Photos are never recolored. Toggle with Ctrl+I."
+                        color: Theme.mutedForeground
+                        font.pixelSize: 12
+                        lineHeight: 1.15
+                        renderType: Text.QtRendering
+                    }
+                }
+
+                Rectangle {
+                    id: ptSwitch
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    width: 44
+                    height: 24
+                    radius: 12
+                    color: Theme.pdfTheme ? Theme.accent : Theme.selection
+                    border.color: Theme.pdfTheme ? Theme.accent : Theme.mutedForeground
+                    border.width: 1
+                    Rectangle {
+                        width: 18
+                        height: 18
+                        radius: 9
+                        y: 3
+                        x: Theme.pdfTheme ? parent.width - width - 3 : 3
+                        color: Theme.pdfTheme ? Theme.darkerBackground : Theme.foreground
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: Theme.pdfTheme = !Theme.pdfTheme
+                    }
+                }
+            }
+
+            Item {
+                visible: Theme.pdfTheme
+                width: parent.width
+                height: 24
+
+                Text {
+                    id: opLabel
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Opacity"
+                    color: Theme.foreground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                Text {
+                    id: opValue
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: Math.round(Theme.pdfOpacity * 100) + "%"
+                    color: Theme.mutedForeground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+                Rectangle {
+                    id: opTrack
+                    anchors.left: opLabel.right
+                    anchors.leftMargin: 14
+                    anchors.right: opValue.left
+                    anchors.rightMargin: 14
+                    anchors.verticalCenter: parent.verticalCenter
+                    height: 4
+                    radius: 2
+                    color: Theme.selection
+                    Rectangle {
+                        width: parent.width * (Theme.pdfOpacity - 0.4) / 0.6
+                        height: parent.height
+                        radius: 2
+                        color: Theme.accent
+                    }
+                    Rectangle {
+                        width: 14
+                        height: 14
+                        radius: 7
+                        anchors.verticalCenter: parent.verticalCenter
+                        x: parent.width * (Theme.pdfOpacity - 0.4) / 0.6 - width / 2
+                        color: Theme.foreground
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        anchors.topMargin: -10
+                        anchors.bottomMargin: -10
+                        cursorShape: Qt.PointingHandCursor
+                        function setFrom(mx) {
+                            Theme.pdfOpacity = 0.4 + 0.6 * Math.max(0, Math.min(1, mx / opTrack.width))
+                        }
+                        onPressed: (m) => setFrom(m.x)
+                        onPositionChanged: (m) => { if (pressed) setFrom(m.x) }
+                    }
+                }
+            }
+
+            Rectangle {
+                width: parent.width
+                height: 1
+                color: Theme.mutedForeground
+                opacity: 0.35
+            }
+
+            Item {
+                width: parent.width
                 height: aiText.implicitHeight
 
                 Column {
@@ -3803,6 +3942,7 @@ Window {
     Shortcut { sequence: "Ctrl+r"; enabled: !root.typing; onActivated: root.reloadFile(false) }
     Shortcut { sequence: "Ctrl+Shift+o"; enabled: !root.typing;
                onActivated: root.recognizeCurrentPage() }
+    Shortcut { sequence: "Ctrl+I"; onActivated: Theme.pdfTheme = !Theme.pdfTheme }
     Shortcut { sequence: "Ctrl+,"; onActivated: root.showSettings = !root.showSettings }
     Shortcut { sequence: "s"; enabled: !root.typing; onActivated: root.toggleReading() }
     Shortcut { sequence: "]"; enabled: !root.typing && root.readActive; onActivated: Reader.nextParagraph() }

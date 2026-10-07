@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Quick Qml)
+find_package(Qt6 REQUIRED COMPONENTS Quick Qml ShaderTools)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(TESSERACT REQUIRED IMPORTED_TARGET tesseract)
 pkg_check_modules(LEPTONICA REQUIRED IMPORTED_TARGET lept)
@@ -42,6 +42,10 @@ target_link_libraries(glance PRIVATE
     "${CMAKE_SOURCE_DIR}/third_party/mupdf/build/release/libmupdf.a"
     ${MUPDF_THIRD}
     pthread m)
+
+qt_add_shaders(glance "glance_shaders"
+    PREFIX "/"
+    FILES shaders/recolor.frag)
 
 qt_add_executable(glance-ocr-worker src/ocrworker.cpp)
 target_link_libraries(glance-ocr-worker PRIVATE

@@ -300,6 +300,7 @@ void Document::reset()
     m_labelsBuilt = false;
     m_labelsRequested = false;
     m_imageRectCache.clear();
+    m_colorRectCache.clear();
     cancelSearch();
     m_textPool.waitForDone();
     m_infoPool.waitForDone();
@@ -435,6 +436,7 @@ QVariantMap Document::computePageInfo(int pageNumber) const
     info.insert(QStringLiteral("chars"), chars);
     info.insert(QStringLiteral("boxes"), boxes);
     info.insert(QStringLiteral("imageRects"), rects);
+    info.insert(QStringLiteral("colorRects"), pageColorRects(pageNumber));
     return info;
 }
 
@@ -966,6 +968,49 @@ QVariantList Document::pageImageRects(int pageNumber) const
                                  {QStringLiteral("w"), found[i].width()},
                                  {QStringLiteral("h"), found[i].height()}});
     m_imageRectCache.insert(pageNumber, rects);
+    return rects;
+}
+
+QVariantList Document::pageColorRects(int pageNumber) const
+{
+    if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
+        return {};
+    QMutexLocker lock(&m_mutex);
+    if (m_colorRectCache.contains(pageNumber))
+        return m_colorRectCache.value(pageNumber);
+
+    QVariantList rects;
+    fz_stext_page *text = nullptr;
+    fz_try(m_ctx) {
+        const QPointF origin = m_origins.at(pageNumber);
+        const QSizeF size = m_sizes.at(pageNumber);
+        fz_stext_options options{};
+        options.flags = FZ_STEXT_PRESERVE_IMAGES;
+        text = fz_new_stext_page_from_page_number(m_ctx, m_doc, pageNumber, &options);
+        const double pageArea = std::max(1.0, size.width() * size.height());
+        for (fz_stext_block *block = text->first_block; block && rects.size() < 60;
+             block = block->next) {
+            if (block->type != FZ_STEXT_BLOCK_IMAGE)
+                continue;
+            QRectF r(block->bbox.x0 - origin.x(), block->bbox.y0 - origin.y(),
+                     block->bbox.x1 - block->bbox.x0, block->bbox.y1 - block->bbox.y0);
+            r = r.intersected(QRectF(QPointF(0, 0), size));
+            // A page-sized picture is a scan: it is the page, so recolour it.
+            if (r.width() < 6 || r.height() < 6 || r.width() * r.height() > 0.85 * pageArea)
+                continue;
+            rects.append(QVariantMap{{QStringLiteral("x"), r.x()},
+                                     {QStringLiteral("y"), r.y()},
+                                     {QStringLiteral("w"), r.width()},
+                                     {QStringLiteral("h"), r.height()}});
+        }
+    }
+    fz_always(m_ctx) {
+        fz_drop_stext_page(m_ctx, text);
+    }
+    fz_catch(m_ctx) {
+        rects.clear();
+    }
+    m_colorRectCache.insert(pageNumber, rects);
     return rects;
 }
 

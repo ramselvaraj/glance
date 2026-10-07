@@ -11,6 +11,10 @@ Item {
     property int rotationAngle: 0
     property real dpr: Screen.devicePixelRatio
 
+    // PDF theme: recolor the page to the system theme (documents only; photos
+    // are left alone).
+    readonly property bool recolor: Theme.pdfTheme && !root.isImageDoc
+
     readonly property bool sideways: (rotationAngle === 90 || rotationAngle === 270)
     // Round UP so the texture is never smaller than what is displayed; a
     // bucket below the display scale is what makes pages look soft.
@@ -66,48 +70,86 @@ Item {
 
         Rectangle {
             anchors.fill: parent
-            color: "white"
-            border.color: pg.darkerEdge
+            color: pg.recolor ? "transparent" : "white"
+            border.color: pg.recolor ? "transparent" : pg.darkerEdge
             border.width: 1
             antialiasing: true
         }
 
-        // Bottom layer: the last texture that finished loading. Keeps the page
-        // visible while the next bucket is being rendered, so zooming never
-        // blanks. Both layers are visible so Qt keeps their pixmaps alive.
-        Image {
-            id: base
+        // Page pixels. In PDF theme this item is rendered through the recolor
+        // shader; otherwise it is drawn directly and the PDF is untouched.
+        Item {
+            id: pageContent
             anchors.fill: parent
-            source: pg.shownSource
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            cache: true
-            asynchronous: true
-        }
+            layer.enabled: pg.recolor
+            layer.effect: ShaderEffect {
+                property color lightColor: Theme.background
+                property color darkColor: Theme.foreground
+                property real keepHue: 1.0
+                property real paperAlpha: Theme.pdfOpacity
+                fragmentShader: "qrc:/shaders/recolor.frag.qsb"
+            }
 
-        // Top layer: the requested texture. Fades in when ready, then becomes
-        // the base. Uses a status flag rather than comparing QUrl to string.
-        Image {
-            id: sharp
-            anchors.fill: parent
-            source: pg.requestedSource
-            fillMode: Image.PreserveAspectFit
-            smooth: true
-            cache: true
-            asynchronous: true
-            property bool sharpReady: false
-            opacity: sharpReady ? 1 : 0
-            onSourceChanged: sharpReady = false
-            onStatusChanged: {
-                sharpReady = (status === Image.Ready)
-                if (status !== Image.Loading && pg.pendingExp >= 0
-                        && pg.pendingExp !== pg.renderedExp) {
-                    pg.renderedExp = pg.pendingExp
-                    pg.pendingExp = -1
+            // Bottom layer: the last texture that finished loading. Keeps the page
+            // visible while the next bucket is being rendered, so zooming never
+            // blanks. Both layers are visible so Qt keeps their pixmaps alive.
+            Image {
+                id: base
+                anchors.fill: parent
+                source: pg.shownSource
+                fillMode: Image.PreserveAspectFit
+                smooth: true
+                cache: true
+                asynchronous: true
+            }
+
+            // Top layer: the requested texture. Fades in when ready, then becomes
+            // the base. Uses a status flag rather than comparing QUrl to string.
+            Image {
+                id: sharp
+                anchors.fill: parent
+                source: pg.requestedSource
+                fillMode: Image.PreserveAspectFit
+                smooth: true
+                cache: true
+                asynchronous: true
+                property bool sharpReady: false
+                opacity: sharpReady ? 1 : 0
+                onSourceChanged: sharpReady = false
+                onStatusChanged: {
+                    sharpReady = (status === Image.Ready)
+                    if (status !== Image.Loading && pg.pendingExp >= 0
+                            && pg.pendingExp !== pg.renderedExp) {
+                        pg.renderedExp = pg.pendingExp
+                        pg.pendingExp = -1
+                    }
+                }
+                onSharpReadyChanged: if (sharpReady) {
+                    pg.shownSource = pg.requestedSource
                 }
             }
-            onSharpReadyChanged: if (sharpReady) {
-                pg.shownSource = pg.requestedSource
+        }
+
+        // Pictures keep their own colours in PDF theme: the untouched page
+        // texture, clipped to each picture's box, drawn over the recolored one.
+        Repeater {
+            model: pg.recolor ? pg.colorRects : []
+            delegate: Item {
+                x: modelData.x * pg.zoom
+                y: modelData.y * pg.zoom
+                width: modelData.w * pg.zoom
+                height: modelData.h * pg.zoom
+                clip: true
+                Image {
+                    x: -parent.x
+                    y: -parent.y
+                    width: holder.width
+                    height: holder.height
+                    source: pg.shownSource
+                    fillMode: Image.PreserveAspectFit
+                    smooth: true
+                    cache: true
+                }
             }
         }
 
@@ -224,11 +266,20 @@ Item {
     }
 
     property var links: []
+    property var colorRects: []
+    function loadColorRects() {
+        const info = Doc.cachedPageInfo(page)
+        colorRects = info.colorRects || []
+    }
     Connections {
         target: Doc
         function onLinksReady(page, list) {
             if (page === pg.page)
                 pg.links = list
+        }
+        function onPageInfoReady(page) {
+            if (page === pg.page)
+                pg.loadColorRects()
         }
     }
 
@@ -236,6 +287,7 @@ Item {
     Component.onCompleted: {
         darkerEdge = Theme.darkerBackground
         links = Doc.cachedLinks(page)
+        loadColorRects()
         Doc.requestLinks(page)
         renderedExp = bucketExp
         ready = true

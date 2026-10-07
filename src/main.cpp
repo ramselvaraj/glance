@@ -8,6 +8,7 @@
 #include <QCursor>
 #include <QImageReader>
 #include <QScreen>
+#include <QQuickWindow>
 #include <cstdio>
 #include <algorithm>
 
@@ -412,6 +413,10 @@ int main(int argc, char *argv[])
         }
         return 0;
     }
+
+    // The surface must be alpha-capable from creation for PDF theme's
+    // translucency to be switchable at runtime; it stays opaque otherwise.
+    QQuickWindow::setDefaultAlphaBuffer(true);
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty("Doc", doc);

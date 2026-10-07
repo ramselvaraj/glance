@@ -7,6 +7,7 @@
 #include <QProcess>
 #include <QProcessEnvironment>
 #include <QDebug>
+#include <QSettings>
 
 Theme::Theme(QObject *parent)
     : QObject(parent)
@@ -20,7 +21,30 @@ Theme::Theme(QObject *parent)
     connect(&m_watcher, &QFileSystemWatcher::directoryChanged,
             this, &Theme::scheduleReload);
 
+    QSettings settings;
+    m_pdfTheme = settings.value(QStringLiteral("view/pdfTheme"), false).toBool();
+    m_pdfOpacity = qBound(0.4, settings.value(QStringLiteral("view/pdfOpacity"), 0.88).toDouble(), 1.0);
+
     reload();
+}
+
+void Theme::setPdfTheme(bool on)
+{
+    if (on == m_pdfTheme)
+        return;
+    m_pdfTheme = on;
+    QSettings().setValue(QStringLiteral("view/pdfTheme"), on);
+    emit pdfThemeChanged();
+}
+
+void Theme::setPdfOpacity(qreal v)
+{
+    v = qBound(0.4, v, 1.0);
+    if (qFuzzyCompare(v, m_pdfOpacity))
+        return;
+    m_pdfOpacity = v;
+    QSettings().setValue(QStringLiteral("view/pdfOpacity"), v);
+    emit pdfThemeChanged();
 }
 
 // Omarchy stages the active theme under $XDG_STATE_HOME/omarchy/current and
