@@ -109,6 +109,8 @@ private:
         QString text;                // cleaned for speech; empty = nothing to say
         qint64 endByte = 0;          // cumulative end offset once queued for playback
         qint64 audioBytes = 0;       // length of the speech itself, without the pause after it
+        qint64 speechStart = 0;      // where the voice really starts and stops inside the audio
+        qint64 speechEnd = 0;        // (bytes), leaving out the silence at either end
         QString kind;                // body, heading...
         bool listItem = false;       // a bullet or numbered item: shorter gap after it
     };

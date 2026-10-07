@@ -1034,31 +1034,45 @@ Window {
 
     // ---------- magnifier ----------
 
-    // Where in a sentence the voice is: characters weighted so that commas and
-    // full stops, which the voice pauses on, take longer than letters.
+    // Where in a sentence the voice is. Speaking time follows syllables rather than
+    // letters, and commas and full stops cost a short pause; `progress` already
+    // leaves out the silence around the sentence.
     function lensCharAt(text, progress) {
-        const n = text.length
-        if (n === 0)
-            return 0
-        const cumulative = []
+        const words = []
+        const re = /\S+/g
+        let m
         let total = 0
-        for (let i = 0; i < n; ++i) {
-            const c = text[i]
-            let w = 1
-            if (c === " ")
-                w = 0.6
-            else if (",;:".indexOf(c) >= 0)
-                w = 4
-            else if (".!?".indexOf(c) >= 0 && (i === n - 1 || text[i + 1] === " "))
-                w = 7
-            total += w
-            cumulative.push(total)
+        while ((m = re.exec(text)) !== null) {
+            const w = m[0]
+            const letters = w.toLowerCase().replace(/[^a-z]/g, "")
+            let weight
+            if (letters.length === 0) {
+                weight = Math.max(0.4, w.replace(/\D/g, "").length * 0.9)   // digits are said one by one
+            } else {
+                let syllables = (letters.match(/[aeiouy]+/g) || []).length
+                if (letters.endsWith("e") && !letters.endsWith("le") && syllables > 1)
+                    --syllables
+                weight = 0.4 + Math.max(1, syllables)
+            }
+            const tail = w.charAt(w.length - 1)
+            if (",".indexOf(tail) >= 0)
+                weight += 0.7
+            else if (";:".indexOf(tail) >= 0)
+                weight += 0.9
+            else if (".!?".indexOf(tail) >= 0 && m.index + w.length < text.length)
+                weight += 1.0
+            words.push({ start: m.index, length: w.length, from: total, weight: weight })
+            total += weight
         }
-        const target = Math.max(0, Math.min(1, (progress - 0.03) / 0.93)) * total
-        for (let i = 0; i < n; ++i)
-            if (cumulative[i] >= target)
-                return i
-        return n - 1
+        if (words.length === 0)
+            return 0
+        const target = Math.max(0, Math.min(1, progress)) * total
+        for (const w of words) {
+            if (target < w.from + w.weight)
+                return w.start + Math.min(w.length - 1, Math.floor((target - w.from) / w.weight * w.length))
+        }
+        const last = words[words.length - 1]
+        return last.start + last.length - 1
     }
 
     function lensUpdate() {

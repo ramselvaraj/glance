@@ -20,6 +20,9 @@ namespace {
 constexpr int kPrefetchUnits = 3;          // sentences synthesized ahead of the one playing
 // Gaps are what let a listener take in what was just said. They are scaled by
 // the speaking speed so that fast reading keeps its proportions.
+// Between handing audio to the player and hearing it: the player's own buffer
+// plus the audio device. Without allowing for it, highlights run ahead of the voice.
+constexpr int kOutputLatencyMs = 230;
 constexpr int kSentencePauseMs = 280;
 constexpr int kParagraphPauseMs = 1000;
 constexpr int kListItemPauseMs = 650;
@@ -39,6 +42,33 @@ QString setupScript()
     const QString installed = QCoreApplication::applicationDirPath()
         + QStringLiteral("/glance-setup-tts");
     return QFileInfo::exists(installed) ? installed : QStringLiteral(SETUP_TTS_SOURCE_S);
+}
+
+// Where the voice is actually heard inside a synthesized sentence: Kokoro pads
+// both ends with silence, and the size of the padding varies.
+void speechBounds(const QByteArray &pcm, int rate, qint64 &start, qint64 &end)
+{
+    const qint16 *s = reinterpret_cast<const qint16 *>(pcm.constData());
+    const qint64 n = pcm.size() / 2;
+    const qint64 window = std::max(1, rate / 100);   // 10 ms
+    constexpr int kThreshold = 400;                  // about -38 dBFS
+    start = 0;
+    end = pcm.size();
+    qint64 first = -1, last = -1;
+    for (qint64 i = 0; i + window <= n; i += window) {
+        int peak = 0;
+        for (qint64 k = 0; k < window; ++k)
+            peak = std::max(peak, std::abs(int(s[i + k])));
+        if (peak > kThreshold) {
+            if (first < 0)
+                first = i;
+            last = i + window;
+        }
+    }
+    if (first >= 0 && last > first) {
+        start = first * 2;
+        end = last * 2;
+    }
 }
 
 bool endsWithAbbreviation(const QString &s)
@@ -619,6 +649,10 @@ void Reader::handleAudio(int unitIndex, int rate, const QByteArray &pcm)
     m_queuedBytes += audio.size();
     m_units[unitIndex].endByte = m_queuedBytes;
     m_units[unitIndex].audioBytes = pcm.size();
+    speechBounds(pcm, rate, m_units[unitIndex].speechStart, m_units[unitIndex].speechEnd);
+    if (qEnvironmentVariableIsSet("GLANCE_TTS_DEBUG"))
+        qInfo("unit %d: audio %.2fs, voice %.2fs..%.2fs", unitIndex, pcm.size() / 2.0 / rate,
+              m_units[unitIndex].speechStart / 2.0 / rate, m_units[unitIndex].speechEnd / 2.0 / rate);
     if (m_state == Loading)
         setState(Playing);
 }
@@ -644,9 +678,11 @@ void Reader::pump()
             m_writtenBytes += n;
         }
     }
+    // What can be heard now is a little behind what has been handed over.
+    const qint64 audible = std::max<qint64>(0, played - qint64(m_rate) * 2 * kOutputLatencyMs / 1000);
     int heard = m_current;
     for (int i = std::max(m_current, 0); i < m_units.size(); ++i) {
-        if (m_units[i].endByte == 0 || played < m_units[i].endByte) {
+        if (m_units[i].endByte == 0 || audible < m_units[i].endByte) {
             heard = i;
             break;
         }
@@ -661,8 +697,9 @@ void Reader::pump()
     if (heard >= 0 && heard < m_units.size()) {
         const Unit &u = m_units[heard];
         const qint64 start = (heard > 0 && m_units[heard - 1].endByte > 0) ? m_units[heard - 1].endByte : 0;
-        const qreal p = u.audioBytes > 0
-            ? std::clamp(qreal(played - start) / qreal(u.audioBytes), 0.0, 1.0) : 0.0;
+        const qint64 spoken = u.speechEnd - u.speechStart;
+        const qreal p = spoken > 0
+            ? std::clamp(qreal(audible - start - u.speechStart) / qreal(spoken), 0.0, 1.0) : 0.0;
         if (std::abs(p - m_progress) >= 0.004 || (p == 0 && m_progress != 0)) {
             m_progress = p;
             emit progressChanged();
