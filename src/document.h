@@ -27,6 +27,8 @@ class Document : public QObject {
     // Bumped on every (re)load so page/thumbnail image URLs change and a reloaded
     // file never shows the previous version from the pixmap cache.
     Q_PROPERTY(int generation READ generation NOTIFY pageCountChanged)
+    // Bumped when the background page-label build finishes, so bindings refresh.
+    Q_PROPERTY(int labelsVersion READ labelsVersion NOTIFY labelsReady)
     // What is actually opened: the file itself, or a cached PNG made from a
     // format MuPDF cannot read but Qt can (WebP, ICO, TGA). Use this for OCR.
     Q_PROPERTY(QString ocrPath READ ocrPath NOTIFY pageCountChanged)
@@ -41,6 +43,7 @@ public:
     QString fileName() const;
     QString filePath() const { return m_path; }
     int generation() const { return m_generation; }
+    int labelsVersion() const { return m_labelsVersion; }
     QString ocrPath() const { return m_openPath.isEmpty() ? m_path : m_openPath; }
 
     int pageCount() const { return m_pageCount; }
@@ -57,6 +60,17 @@ public:
     // Page size in PDF points. Thread-safe.
     Q_INVOKABLE QSizeF pageSizePt(int page) const;
     Q_INVOKABLE bool pageHasText(int page) const;
+    // Everything the viewer needs to decide about OCR and highlighting a page,
+    // computed on a worker thread so the GUI never waits on the MuPDF lock:
+    // {hasText, hasImages, chars, boxes, imageRects}. cachedPageInfo() returns an
+    // empty map until requestPageInfo() has finished (pageInfoReady(page)).
+    Q_INVOKABLE QVariantMap cachedPageInfo(int page) const;
+    Q_INVOKABLE void requestPageInfo(int page);
+    // Same data computed right now (may wait for the lock): explicit user actions.
+    Q_INVOKABLE QVariantMap pageInfo(int page) const;
+    // Like selectTextAt but never waits: returns {busy:true} when the lock is
+    // taken or the page's text is not extracted yet (hover path).
+    Q_INVOKABLE QVariantMap hoverTextAt(int page, QPointF point) const;
     Q_INVOKABLE bool pageHasImages(int page) const;
     // Embedded images big enough to hold readable text, as page-point rects
     // [{x,y,w,h}] (largest first, at most 6, slightly padded). Cached.
@@ -137,6 +151,8 @@ signals:
     void fileChangedOnDisk();
     void allTextReady(int generation, const QStringList &pages);
     void linksReady(int page, const QVariantList &links);
+    void pageInfoReady(int page);
+    void labelsReady();
     void pageCountChanged(int count);
     void searchFinished(int generation, const QVariantList &results);
 
@@ -151,7 +167,14 @@ private:
     mutable QMutex m_linkMutex;
     void ensureLabels() const;
     mutable QStringList m_labels;
-    mutable bool m_labelsBuilt = false;
+    mutable std::atomic<bool> m_labelsBuilt{false};   // m_labels is read-only once true
+    mutable std::atomic<bool> m_labelsRequested{false};
+    mutable int m_labelsVersion = 0;
+    mutable QHash<int, QVariantMap> m_pageInfoCache;
+    mutable QHash<int, bool> m_pageInfoPending;
+    mutable QMutex m_infoMutex;
+    QVariantMap selectTextAtImpl(int page, QPointF point, const QString &mode, bool wait) const;
+    QVariantMap computePageInfo(int page) const;
     QVariantMap selectTextStream(int page, QPointF anchor, QPointF focus) const;
     bool pageTextEndpoints(int page, QPointF &first, QPointF &last) const;
 
@@ -179,6 +202,9 @@ private:
     mutable QMutex m_readMutex;
     mutable QVector<ReadParagraph> m_readCache;
     mutable QThreadPool m_renderPool;
+    // Page info, labels and links: small jobs that must not queue behind a long
+    // search or select-all on m_textPool.
+    QThreadPool m_infoPool;
     QThreadPool m_textPool;
     std::atomic<int> m_searchGeneration{0};
 };

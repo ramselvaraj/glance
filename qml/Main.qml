@@ -557,6 +557,7 @@ Window {
     function pageIndicator() {
         if (pageCount <= 0)
             return ""
+        const labelsVersion = Doc.labelsVersion      // re-evaluate when labels finish loading
         const label = Doc.pageLabel(currentPage - 1)
         const position = currentPage + " / " + pageCount
         return label !== "" && label !== String(currentPage)
@@ -1193,8 +1194,12 @@ Window {
     function allDocBoxesForPage(page) {
         if (allDocBoxes[page] !== undefined)
             return allDocBoxes[page]
-        const size = Doc.pageSizePt(page)
-        let boxes = Doc.selectText(page, Qt.point(0, 0), Qt.point(size.width, size.height)).boxes
+        const info = Doc.cachedPageInfo(page)
+        if (info.hasText === undefined) {
+            Doc.requestPageInfo(page)        // pageInfoReady refreshes the highlight
+            return ocrPages[page] ? sortedOcrWords(page) : []
+        }
+        let boxes = info.boxes
         if (boxes.length === 0 && ocrPages[page])
             boxes = sortedOcrWords(page)
         allDocBoxes[page] = boxes     // plain cache; no binding depends on it
@@ -1543,7 +1548,17 @@ Window {
         if (page < 0 || page >= pageCount
                 || (ocrPages[page] !== undefined && !ocrPages[page].partial))
             return false
-        const hasText = Doc.pageHasText(page)
+        // Native text and image facts come from the background page-info cache, so
+        // deciding about OCR never makes the UI wait on the MuPDF lock.
+        let info = Doc.cachedPageInfo(page)
+        if (info.hasText === undefined) {
+            if (!explicit) {
+                Doc.requestPageInfo(page)      // onPageInfoReady re-schedules OCR
+                return false
+            }
+            info = Doc.pageInfo(page)          // the user asked: waiting is fine
+        }
+        const hasText = info.hasText
         const capabilities = Object.assign({}, pageTextCapabilities)
         capabilities[page] = hasText
         pageTextCapabilities = capabilities
@@ -1552,17 +1567,14 @@ Window {
         const cropMode = Ocr.rapidAvailable && !isImageDoc
         const size = Doc.pageSizePt(page)
         let regions = []
-        let nativeChars = 0
+        const nativeChars = info.chars
         if (hasText) {
-            const nativeSelection = Doc.selectText(page, Qt.point(0, 0),
-                                                    Qt.point(size.width, size.height))
-            nativeChars = nativeSelection.text.length
             const boxes = Object.assign({}, nativePageBoxes)
-            boxes[page] = nativeSelection.boxes
+            boxes[page] = info.boxes
             nativePageBoxes = boxes
             if (cropMode) {
                 // A full-page backdrop behind a text-rich page is not worth reading.
-                regions = Doc.pageImageRects(page).filter(r =>
+                regions = info.imageRects.filter(r =>
                     nativeChars < 200 || r.w * r.h < 0.85 * size.width * size.height)
             }
         }
@@ -1574,7 +1586,7 @@ Window {
             if (cropMode) {
                 if (regions.length === 0)
                     return false
-            } else if (!Doc.pageHasImages(page) || nativeChars >= 200) {
+            } else if (!info.hasImages || nativeChars >= 200) {
                 return false
             }
         }
@@ -1608,7 +1620,9 @@ Window {
         const key = page + ":" + Math.round(point.x / 3) + ":" + Math.round(point.y / 3)
         if (nativeHoverCache[key] === true)
             return true
-        const result = Doc.selectTextAt(page, point, "word")
+        const result = Doc.hoverTextAt(page, point)
+        if (result.busy)
+            return false      // lock busy / text not ready: skip this frame, never stall
         let hit = false
         for (let i = 0; i < result.boxes.length; ++i) {
             const box = result.boxes[i]
@@ -1695,6 +1709,24 @@ Window {
 
     Connections {
         target: Doc
+        function onPageInfoReady(page) {
+            const info = Doc.cachedPageInfo(page)
+            const capabilities = Object.assign({}, root.pageTextCapabilities)
+            capabilities[page] = info.hasText === true
+            root.pageTextCapabilities = capabilities
+            if (info.hasText === true) {
+                const boxes = Object.assign({}, root.nativePageBoxes)
+                boxes[page] = info.boxes
+                root.nativePageBoxes = boxes
+            }
+            if (root.selectAllDoc && root.selectionPages["*"] === true)
+                root.selectionPages = Object.assign({}, root.selectionPages)
+            if (Math.abs(page - (root.currentPage - 1)) <= 4) {
+                root.scheduleVisibleOcr()       // now we know whether it needs OCR
+                if (!Ocr.running)
+                    nearbyOcrTimer.restart()    // and re-arm the read-ahead
+            }
+        }
         function onAllTextReady(generation, pages) {
             if (!root.selectAllDoc || generation !== Doc.generation)
                 return
@@ -2251,11 +2283,7 @@ Window {
                                 ptW: root.pageSizes[index] ? root.pageSizes[index].width : 612
                                 ptH: root.pageSizes[index] ? root.pageSizes[index].height : 792
                             }
-                            onLoaded: {
-                                const capabilities = Object.assign({}, root.pageTextCapabilities)
-                                capabilities[index] = Doc.pageHasText(index)
-                                root.pageTextCapabilities = capabilities
-                            }
+                            onLoaded: Doc.requestPageInfo(index)
                         }
                     }
                 }
@@ -4003,6 +4031,9 @@ Window {
         }
     }
     onCurrentPageChanged: {
+        // Learn about the pages OCR read-ahead will want, off the GUI thread.
+        for (const offset of [0, 1, 2, 3, -1])
+            Doc.requestPageInfo(currentPage - 1 + offset)
         prefetchAround()
         nearbyOcrTimer.stop()
         if (Ocr.running && ocrRequestedPage !== currentPage - 1) {

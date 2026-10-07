@@ -266,6 +266,7 @@ Document::Document(const QString &path, QObject *parent)
 {
     m_renderPool.setMaxThreadCount(1);
     m_textPool.setMaxThreadCount(1);
+    m_infoPool.setMaxThreadCount(1);
     m_changeTimer.setSingleShot(true);
     connect(&m_changeTimer, &QTimer::timeout, this, &Document::checkFileChange);
     connect(&m_fileWatcher, &QFileSystemWatcher::fileChanged, this, [this] {
@@ -297,10 +298,17 @@ void Document::reset()
         m_fileWatcher.removePaths(m_fileWatcher.directories());
     m_labels.clear();
     m_labelsBuilt = false;
+    m_labelsRequested = false;
     m_imageRectCache.clear();
     cancelSearch();
     m_textPool.waitForDone();
+    m_infoPool.waitForDone();
     m_renderPool.waitForDone();
+    {
+        QMutexLocker lock(&m_infoMutex);
+        m_pageInfoCache.clear();
+        m_pageInfoPending.clear();
+    }
     {
         QMutexLocker lock(&m_linkMutex);
         m_linkCache.clear();
@@ -406,6 +414,77 @@ void Document::checkFileChange()
     }
     if (++m_changeRetries < 30)
         m_changeTimer.start(500);
+}
+
+QVariantMap Document::computePageInfo(int pageNumber) const
+{
+    QVariantMap info;
+    const bool hasText = pageHasText(pageNumber);
+    QVariantList boxes;
+    int chars = 0;
+    if (hasText) {
+        const QSizeF size = pageSizePt(pageNumber);
+        const QVariantMap sel = const_cast<Document *>(this)->selectText(
+            pageNumber, QPointF(0, 0), QPointF(size.width(), size.height()));
+        chars = sel.value(QStringLiteral("text")).toString().size();
+        boxes = sel.value(QStringLiteral("boxes")).toList();
+    }
+    const QVariantList rects = pageImageRects(pageNumber);
+    info.insert(QStringLiteral("hasText"), hasText);
+    info.insert(QStringLiteral("hasImages"), !rects.isEmpty() || pageHasImages(pageNumber));
+    info.insert(QStringLiteral("chars"), chars);
+    info.insert(QStringLiteral("boxes"), boxes);
+    info.insert(QStringLiteral("imageRects"), rects);
+    return info;
+}
+
+QVariantMap Document::cachedPageInfo(int page) const
+{
+    QMutexLocker lock(&m_infoMutex);
+    return m_pageInfoCache.value(page);
+}
+
+QVariantMap Document::pageInfo(int page) const
+{
+    if (!isOpen() || page < 0 || page >= m_pageCount)
+        return {};
+    {
+        QMutexLocker lock(&m_infoMutex);
+        const auto it = m_pageInfoCache.constFind(page);
+        if (it != m_pageInfoCache.constEnd())
+            return it.value();
+    }
+    const QVariantMap info = computePageInfo(page);
+    QMutexLocker lock(&m_infoMutex);
+    m_pageInfoCache.insert(page, info);
+    return info;
+}
+
+void Document::requestPageInfo(int page)
+{
+    if (!isOpen() || page < 0 || page >= m_pageCount)
+        return;
+    {
+        QMutexLocker lock(&m_infoMutex);
+        if (m_pageInfoCache.contains(page) || m_pageInfoPending.value(page))
+            return;
+        m_pageInfoPending.insert(page, true);
+    }
+    const QString path = m_path;
+    m_infoPool.start([this, page, path] {
+        if (path != m_path)
+            return;
+        const QVariantMap info = computePageInfo(page);
+        {
+            QMutexLocker lock(&m_infoMutex);
+            m_pageInfoPending.remove(page);
+            m_pageInfoCache.insert(page, info);
+        }
+        QMetaObject::invokeMethod(this, [this, page, path] {
+            if (path == m_path)
+                emit pageInfoReady(page);
+        }, Qt::QueuedConnection);
+    });
 }
 
 void Document::requestAllText()
@@ -567,7 +646,8 @@ void Document::computeSizes()
 
 QSizeF Document::pageSizePt(int page) const
 {
-    QMutexLocker lock(&m_mutex);
+    // No lock: the sizes are filled in on load and only cleared by reset(),
+    // which both run on the GUI thread after every worker has finished.
     if (page < 0 || page >= m_sizes.size())
         return QSizeF(612, 792);
     return m_sizes.at(page);
@@ -746,13 +826,15 @@ bool Document::openExternal(const QString &uri) const
     return QDesktopServices::openUrl(url);
 }
 
+// Builds every label under the MuPDF lock. Runs on the info pool (or inline for
+// an explicit go-to) so the header never waits on it.
 void Document::ensureLabels() const
 {
     QMutexLocker lock(&m_mutex);
     if (m_labelsBuilt)
         return;
-    m_labelsBuilt = true;
-    m_labels.reserve(m_pageCount);
+    QStringList labels;
+    labels.reserve(m_pageCount);
     for (int i = 0; i < m_pageCount; ++i) {
         QString label = QString::number(i + 1);
         fz_page *page = nullptr;
@@ -768,15 +850,33 @@ void Document::ensureLabels() const
         }
         fz_catch(m_ctx) {
         }
-        m_labels.append(label);
+        labels.append(label);
     }
+    m_labels = labels;
+    m_labelsBuilt = true;
 }
 
 QString Document::pageLabel(int page) const
 {
     if (!isOpen() || page < 0 || page >= m_pageCount)
         return QString();
-    ensureLabels();
+    if (!m_labelsBuilt) {
+        // Build in the background and report back; show the plain number meanwhile.
+        if (!m_labelsRequested.exchange(true)) {
+            Document *self = const_cast<Document *>(this);
+            const QString path = m_path;
+            self->m_infoPool.start([self, path] {
+                self->ensureLabels();
+                QMetaObject::invokeMethod(self, [self, path] {
+                    if (path == self->m_path) {
+                        ++self->m_labelsVersion;
+                        emit self->labelsReady();
+                    }
+                }, Qt::QueuedConnection);
+            });
+        }
+        return QString();
+    }
     return m_labels.value(page);
 }
 
@@ -1206,12 +1306,36 @@ QVariantMap Document::selectTextStream(int pageNumber, QPointF anchor, QPointF f
 QVariantMap Document::selectTextAt(int pageNumber, QPointF point,
                                    const QString &mode) const
 {
+    return selectTextAtImpl(pageNumber, point, mode, true);
+}
+
+QVariantMap Document::hoverTextAt(int pageNumber, QPointF point) const
+{
+    return selectTextAtImpl(pageNumber, point, QStringLiteral("word"), false);
+}
+
+QVariantMap Document::selectTextAtImpl(int pageNumber, QPointF point,
+                                       const QString &mode, bool wait) const
+{
     QVariantMap result{{QStringLiteral("text"), QString()},
                        {QStringLiteral("boxes"), QVariantList()}};
     if (!isOpen() || pageNumber < 0 || pageNumber >= m_pageCount)
         return result;
 
-    QMutexLocker lock(&m_mutex);
+    // The hover path must never stall the GUI: give up if a render holds the
+    // lock, or if this page's text has not been extracted yet (warm it instead).
+    if (wait) {
+        m_mutex.lock();
+    } else if (!m_mutex.tryLock()) {
+        result.insert(QStringLiteral("busy"), true);
+        return result;
+    }
+    struct Unlock { QMutex *m; ~Unlock() { m->unlock(); } } unlock{&m_mutex};
+    if (!wait && !m_textPages.contains(pageNumber)) {
+        result.insert(QStringLiteral("busy"), true);
+        const_cast<Document *>(this)->requestPageInfo(pageNumber);   // queues; cheap
+        return result;
+    }
     char *text = nullptr;
     bool handled = false;   // never `return` inside fz_try: it leaks a stack frame
     fz_try(m_ctx) {
