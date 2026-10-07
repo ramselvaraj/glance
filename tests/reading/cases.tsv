@@ -1,6 +1,6 @@
 # file<TAB>expected kind<TAB>text (a prefix of the paragraph; "=" prefix means the whole text)
 # Run: scripts/check-reading.py   (PDFs are looked up in $GLANCE_TEST_PDFS, default ~/Downloads)
-3555047.pdf	aside	=24
+3555047.pdf	aside|pagenum	=24
 3555047.pdf	heading	Machine Learning Based Framework for Fast Resource
 3555047.pdf	body	Field-programmable gate arrays (FPGAs) have grown
 3555047.pdf	body	Modern integrated circuit (IC) designs

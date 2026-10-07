@@ -135,6 +135,11 @@ public:
     // skipHeadersFooters, skipFootnotes, skipCaptions, skipTables,
     // skipReferences. Only native text is read; scanned pages yield nothing.
     Q_INVOKABLE QVariantList readingParagraphs(const QVariantMap &options) const;
+    // Regions the page-layout model found on a page: [{label, score, x, y, w, h}]
+    // in page points. Pages without them are classified by the heuristics alone.
+    void setPageLayout(int page, const QVector<LayoutRegion> &regions);
+    Q_INVOKABLE bool hasPageLayout(int page) const;
+    Q_INVOKABLE int layoutPageCount() const;
     // The user said a paragraph (given by its feature vector) is junk or main text:
     // the line classifier learns from it and remembers across sessions.
     // The word at a character offset of paragraph `paragraph` (index into the last
@@ -204,6 +209,8 @@ private:
     mutable QHash<int, fz_stext_page *> m_textPages;
     mutable QMutex m_mutex;
     mutable QMutex m_readMutex;
+    mutable QMutex m_layoutMutex;
+    QHash<int, QVector<LayoutRegion>> m_layout;
     mutable QVector<ReadParagraph> m_readCache;
     mutable QThreadPool m_renderPool;
     // Page info, labels and links: small jobs that must not queue behind a long

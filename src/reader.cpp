@@ -375,16 +375,9 @@ int Reader::firstUnitOf(int paragraph) const
     return m_units.size();
 }
 
-void Reader::start(const QStringList &paragraphs, int index, const QStringList &kinds)
+QVector<Reader::Unit> Reader::buildUnits(const QStringList &paragraphs, const QStringList &kinds) const
 {
-    if (!m_enabled)
-        return;
-    if (!available()) {
-        emit errorOccurred(QStringLiteral("Read aloud is not installed"));
-        return;
-    }
-    m_units.clear();
-    m_paragraphCount = paragraphs.size();
+    QVector<Unit> units;
     static const QRegularExpression listMarker(QStringLiteral(R"(^\s*(?:[•▪◦●*\-–—]|\(?\d{1,2}[.)]|\(?[a-z][.)])\s)"));
     for (int p = 0; p < paragraphs.size(); ++p) {
         const QString kind = p < kinds.size() ? kinds[p] : QString();
@@ -398,9 +391,71 @@ void Reader::start(const QStringList &paragraphs, int index, const QStringList &
                                                       : cleanForSpeech(sentences[s]);
             u.kind = kind;
             u.listItem = item;
-            m_units.append(u);
+            units.append(u);
         }
     }
+    return units;
+}
+
+bool Reader::canRefresh() const
+{
+    return (m_state == Playing || m_state == Paused) && m_current >= 0 && m_current < m_units.size()
+        && m_inflightUnit < 0 && m_expectBytes < 0;
+}
+
+bool Reader::refresh(const QStringList &paragraphs, const QStringList &kinds, int paragraph, int sentence)
+{
+    if (!canRefresh())
+        return false;
+    QVector<Unit> units = buildUnits(paragraphs, kinds);
+    const Unit &heard = m_units[m_current];
+    int target = -1;
+    for (int i = 0; i < units.size(); ++i)
+        if (units[i].paragraph == paragraph && units[i].sentence == sentence
+            && units[i].text == heard.text) {
+            target = i;
+            break;
+        }
+    if (target < 0)
+        return false;
+    const int shift = target - m_current;
+    // Everything already synthesized (the sentences from the one heard up to the
+    // next to be requested) has to be the same text in the new list.
+    for (int k = m_current; k < m_nextRequest; ++k) {
+        const int nk = k + shift;
+        if (nk < 0 || nk >= units.size() || units[nk].text != m_units[k].text)
+            return false;
+    }
+    for (int k = m_current; k < m_nextRequest; ++k) {
+        const Unit &old = m_units[k];
+        Unit &u = units[k + shift];
+        u.endByte = old.endByte;
+        u.startByte = old.startByte;
+        u.audioBytes = old.audioBytes;
+        u.speechStart = old.speechStart;
+        u.speechEnd = old.speechEnd;
+    }
+    m_units = units;
+    m_paragraphCount = paragraphs.size();
+    m_current = target;
+    m_nextRequest += shift;
+    m_paragraph = paragraph;
+    m_sentence = sentence;
+    emit unitsChanged();
+    emit positionChanged();
+    return true;
+}
+
+void Reader::start(const QStringList &paragraphs, int index, const QStringList &kinds)
+{
+    if (!m_enabled)
+        return;
+    if (!available()) {
+        emit errorOccurred(QStringLiteral("Read aloud is not installed"));
+        return;
+    }
+    m_units = buildUnits(paragraphs, kinds);
+    m_paragraphCount = paragraphs.size();
     emit unitsChanged();
     if (m_units.isEmpty()) {
         emit finished();
@@ -646,6 +701,7 @@ void Reader::handleAudio(int unitIndex, int rate, const QByteArray &pcm)
     pauseMs = int(pauseMs / std::sqrt(std::max(0.75, m_speed)));
     audio.append(QByteArray(rate * pauseMs / 1000 * 2, '\0'));
     m_pending += audio;
+    m_units[unitIndex].startByte = m_queuedBytes;
     m_queuedBytes += audio.size();
     m_units[unitIndex].endByte = m_queuedBytes;
     m_units[unitIndex].audioBytes = pcm.size();
@@ -696,7 +752,7 @@ void Reader::pump()
         setPosition(heard);
     if (heard >= 0 && heard < m_units.size()) {
         const Unit &u = m_units[heard];
-        const qint64 start = (heard > 0 && m_units[heard - 1].endByte > 0) ? m_units[heard - 1].endByte : 0;
+        const qint64 start = u.startByte;
         const qint64 spoken = u.speechEnd - u.speechStart;
         const qreal p = spoken > 0
             ? std::clamp(qreal(audible - start - u.speechStart) / qreal(spoken), 0.0, 1.0) : 0.0;

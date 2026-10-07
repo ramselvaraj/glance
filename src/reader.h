@@ -77,6 +77,15 @@ public:
     // spoken and paced differently from running text.
     Q_INVOKABLE void start(const QStringList &paragraphs, int index = 0,
                            const QStringList &kinds = QStringList());
+    // True when the list of paragraphs can be swapped for a better one without a
+    // break in the voice (nothing is being synthesized at this instant).
+    Q_INVOKABLE bool canRefresh() const;
+    // Replaces what is being read with a re-judged version of the same document,
+    // keeping the sentence now being heard (`paragraph` is its index in the new
+    // list). False when the new list does not line up with what is already
+    // synthesized; the caller can then restart with start().
+    Q_INVOKABLE bool refresh(const QStringList &paragraphs, const QStringList &kinds,
+                             int paragraph, int sentence);
     Q_INVOKABLE void pause();
     Q_INVOKABLE void resume();
     Q_INVOKABLE void toggle();
@@ -108,6 +117,7 @@ private:
         int sentence = 0;
         QString text;                // cleaned for speech; empty = nothing to say
         qint64 endByte = 0;          // cumulative end offset once queued for playback
+        qint64 startByte = 0;        // where its audio begins in the player's byte stream
         qint64 audioBytes = 0;       // length of the speech itself, without the pause after it
         qint64 speechStart = 0;      // where the voice really starts and stops inside the audio
         qint64 speechEnd = 0;        // (bytes), leaving out the silence at either end
@@ -115,9 +125,12 @@ private:
         bool listItem = false;       // a bullet or numbered item: shorter gap after it
     };
 
+public:
     static QString dataDir();
+private:
     static QString cleanForSpeech(const QString &sentence);
     static QString speechForHeading(const QString &heading);
+    QVector<Unit> buildUnits(const QStringList &paragraphs, const QStringList &kinds) const;
     void setState(State state);
     void restartAt(int unit);
     void ensureWorker();

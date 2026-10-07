@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Checks how read-aloud classifies known paragraphs (tests/reading/cases.tsv).
 
-Usage: scripts/check-reading.py [path/to/glance]
+Usage: scripts/check-reading.py [--rules-only] [path/to/glance]
+
+By default the page-layout model is used when it is installed; --rules-only checks
+the heuristics alone, which is what runs on pages the model has not looked at.
 Exits non-zero when any case fails, and prints each failure with what was found.
 """
 import os
@@ -10,7 +13,9 @@ import subprocess
 import sys
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-binary = sys.argv[1] if len(sys.argv) > 1 else os.path.join(root, "build", "glance")
+args = [a for a in sys.argv[1:] if not a.startswith("--")]
+rules_only = "--rules-only" in sys.argv
+binary = args[0] if args else os.path.join(root, "build", "glance")
 pdfs = os.environ.get("GLANCE_TEST_PDFS", os.path.expanduser("~/Downloads"))
 
 cases = []
@@ -27,6 +32,8 @@ cache = {}
 def paragraphs(name):
     if name not in cache:
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+        if not rules_only:
+            env["GLANCE_READ_LAYOUT"] = "1"
         out = subprocess.run([binary, "--read-selftest", os.path.join(pdfs, name)],
                              capture_output=True, text=True, env=env).stdout
         items = []
@@ -46,7 +53,7 @@ for name, kind, text in cases:
     exact = text.startswith("=")
     needle = text[1:] if exact else text
     found = [k for k, t in paragraphs(name) if (t == needle if exact else t.startswith(needle))]
-    if kind in found:
+    if any(k in found for k in kind.split("|")):
         passed += 1
     else:
         failed += 1

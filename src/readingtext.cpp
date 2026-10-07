@@ -141,6 +141,42 @@ bool looksLikeBackMatterHeading(const QString &t)
     return re.match(t.trimmed()).hasMatch();
 }
 
+// What the layout model calls a region, in this file's terms. Returns false for
+// labels that decide nothing.
+bool kindForLayout(const QString &label, const QString &text, Kind &kind)
+{
+    if (label == QLatin1String("header") || label == QLatin1String("header_image")) {
+        kind = Kind::Header;
+    } else if (label == QLatin1String("footer") || label == QLatin1String("footer_image")) {
+        kind = Kind::Footer;
+    } else if (label == QLatin1String("number")) {
+        kind = isPageNumber(text) ? Kind::PageNum : Kind::Aside;
+    } else if (label == QLatin1String("table")) {
+        kind = Kind::Table;
+    } else if (label == QLatin1String("figure_title")) {
+        kind = Kind::Caption;
+    } else if (label == QLatin1String("vision_footnote") || label == QLatin1String("footnote")) {
+        kind = Kind::Footnote;
+    } else if (label == QLatin1String("chart") || label == QLatin1String("image")
+               || label == QLatin1String("seal") || label == QLatin1String("vertical_text")
+               || label == QLatin1String("aside_text")) {
+        kind = Kind::Aside;
+    } else if (label == QLatin1String("display_formula") || label == QLatin1String("formula_number")) {
+        kind = Kind::Math;
+    } else if (label == QLatin1String("paragraph_title") || label == QLatin1String("doc_title")) {
+        kind = Kind::Heading;
+    } else if (label == QLatin1String("reference") || label == QLatin1String("reference_content")) {
+        kind = Kind::Reference;
+    } else if (label == QLatin1String("text") || label == QLatin1String("abstract")
+               || label == QLatin1String("content") || label == QLatin1String("algorithm")
+               || label == QLatin1String("inline_formula")) {
+        kind = Kind::Body;
+    } else {
+        return false;
+    }
+    return true;
+}
+
 bool verticalOverlap(const QRectF &a, const QRectF &b)
 {
     const double overlap = std::min(a.bottom(), b.bottom()) - std::max(a.top(), b.top());
@@ -515,8 +551,24 @@ QVector<ReadParagraph> buildReadingParagraphs(const QVector<QVector<ReadLine>> &
                 return true;
             }();
 
-            // What the PDF says about its own content outranks any guess.
-            if (l.tag == QLatin1String("artifact")) {
+            // A page the layout model has looked at is judged by what it saw; the rest
+            // falls through to the PDF's tags and the layout heuristics below.
+            Kind seen = Kind::Body;
+            bool byLayout = !l.layout.isEmpty() && l.layoutScore >= 0.45
+                            && kindForLayout(l.layout, t, seen);
+            // Sanity checks on the model: running headers and footers repeat from page
+            // to page (or are short), and a bullet is a list, not a table cell.
+            if (byLayout && (seen == Kind::Header || seen == Kind::Footer)
+                && t.size() > 24 && pageSpread.value(signature(t)) < 2)
+                byLayout = false;
+            if (byLayout && seen == Kind::Table && startsWithBullet(t))
+                byLayout = false;
+
+            if (byLayout) {
+                it.kind = seen;
+                if (seen == Kind::Heading && t.size() >= 160)
+                    it.kind = Kind::Body;      // a long "title" is really a paragraph
+            } else if (l.tag == QLatin1String("artifact")) {
                 it.kind = top ? Kind::Header : (bottom ? Kind::Footer : Kind::Aside);
             } else if (l.tag == QLatin1String("figure")) {
                 it.kind = Kind::Aside;
@@ -615,6 +667,10 @@ QVector<ReadParagraph> buildReadingParagraphs(const QVector<QVector<ReadLine>> &
             for (Item &it : items) {
                 if (it.kind != Kind::Body && it.kind != Kind::Aside && it.kind != Kind::Heading
                     && it.kind != Kind::Footnote)
+                    continue;
+                // A line the layout model has placed in a region of its own is not
+                // second-guessed by a box grown around nearby cells.
+                if (!it.line->layout.isEmpty() && it.line->layoutScore >= 0.45)
                     continue;
                 for (const Cluster &cl : clusters)
                     if (cl.cells >= 3 && cl.rect.adjusted(-2, -2, 2, 2).contains(it.line->box.center())) {

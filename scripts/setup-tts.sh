@@ -34,6 +34,25 @@ if [ ! -x "$tts_dir/runtime/bin/python" ] \
         'kokoro-onnx>=0.4' numpy
 fi
 
+# Page-layout model: tells tables, figures, captions, headings, headers and footers
+# apart by looking at the page, so no rule has to guess.
+if ! "$tts_dir/runtime/bin/python" -c 'import rapid_layout, cv2' >/dev/null 2>&1; then
+    "$tts_dir/runtime/bin/python" -m pip install --disable-pip-version-check \
+        rapid-layout opencv-python-headless
+fi
+layout_model=pp_doc_layoutv2.onnx
+layout_sha=0bd2ea0997fe0789f0300292291f8bbf897d890b44a9a3bd5be72afd6198aa90
+if [ ! -s "$tts_dir/$layout_model" ]; then
+    curl -fL --retry 3 -o "$tts_dir/$layout_model.part" \
+        "https://www.modelscope.cn/models/RapidAI/RapidLayout/resolve/v1.2.0/onnx/pp_doc_layout/$layout_model"
+    if [ "$(sha256sum "$tts_dir/$layout_model.part" | cut -d' ' -f1)" != "$layout_sha" ]; then
+        rm -f "$tts_dir/$layout_model.part"
+        echo "Layout model download is corrupt" >&2
+        exit 1
+    fi
+    mv "$tts_dir/$layout_model.part" "$tts_dir/$layout_model"
+fi
+
 for file in kokoro-v1.0.onnx voices-v1.0.bin; do
     if [ ! -s "$tts_dir/$file" ]; then
         curl -fL --retry 3 -o "$tts_dir/$file.part" "$base/$file"

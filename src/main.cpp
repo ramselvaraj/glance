@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QTimer>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QCursor>
 #include <QImageReader>
 #include <QScreen>
@@ -17,6 +18,7 @@
 #include "ocrmanager.h"
 #include "reader.h"
 #include "features.h"
+#include "layoutmanager.h"
 #include "inputstate.h"
 #include "theme.h"
 #include <QThread>
@@ -296,6 +298,25 @@ int main(int argc, char *argv[])
     if (parser.isSet(readSelfOpt)) {
         if (!doc->isOpen())
             return 1;
+        if (qEnvironmentVariableIsSet("GLANCE_READ_LAYOUT")) {
+            LayoutManager analysis(doc);
+            if (!analysis.available()) {
+                fprintf(stderr, "layout model not installed\n");
+            } else {
+                QElapsedTimer clock;
+                clock.start();
+                QEventLoop loop;
+                QObject::connect(&analysis, &LayoutManager::busyChanged, &loop, [&] {
+                    if (!analysis.busy())
+                        loop.quit();
+                });
+                analysis.ensure(0, doc->pageCount());
+                if (analysis.busy())
+                    loop.exec();
+                fprintf(stderr, "layout: %d of %d pages in %lld ms\n", doc->layoutPageCount(),
+                        doc->pageCount(), clock.elapsed());
+            }
+        }
         for (const QVariant &v : doc->readingParagraphs({})) {
             const QVariantMap m = v.toMap();
             if (qEnvironmentVariableIsSet("GLANCE_READ_DEBUG") && m.value("kind").toString() == "aside") {
@@ -442,6 +463,13 @@ int main(int argc, char *argv[])
     reader.setEnabled(features.ai());
     QObject::connect(&features, &Features::aiChanged, &reader,
                      [&features, &reader] { reader.setEnabled(features.ai()); });
+    LayoutManager layout(doc);
+    layout.setEnabled(features.ai());
+    QObject::connect(&features, &Features::aiChanged, &layout,
+                     [&features, &layout] { layout.setEnabled(features.ai()); });
+    QObject::connect(&reader, &Reader::installFinished, &layout,
+                     [&layout] { layout.notifyAvailabilityChanged(); });
+    engine.rootContext()->setContextProperty("PageLayout", &layout);
     engine.rootContext()->setContextProperty("Features", &features);
     engine.rootContext()->setContextProperty("Reader", &reader);
     engine.rootContext()->setContextProperty("Input", &input);

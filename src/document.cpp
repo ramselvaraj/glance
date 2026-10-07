@@ -300,6 +300,10 @@ void Document::reset()
     m_labelsBuilt = false;
     m_labelsRequested = false;
     m_imageRectCache.clear();
+    {
+        QMutexLocker layoutLock(&m_layoutMutex);
+        m_layout.clear();
+    }
     m_colorRectCache.clear();
     cancelSearch();
     m_textPool.waitForDone();
@@ -1043,6 +1047,24 @@ QImage Document::renderPage(int page, qreal scale) const
     return copy;
 }
 
+void Document::setPageLayout(int page, const QVector<LayoutRegion> &regions)
+{
+    QMutexLocker lock(&m_layoutMutex);
+    m_layout.insert(page, regions);
+}
+
+bool Document::hasPageLayout(int page) const
+{
+    QMutexLocker lock(&m_layoutMutex);
+    return m_layout.contains(page);
+}
+
+int Document::layoutPageCount() const
+{
+    QMutexLocker lock(&m_layoutMutex);
+    return m_layout.size();
+}
+
 // A crop of a page, in page points relative to the page origin, at `scale`.
 QImage Document::renderRegion(int page, qreal scale, const QRectF &region) const
 {
@@ -1702,6 +1724,42 @@ struct ReadCollector {
         *lines = out;
     }
 
+    // Each line takes the label of the layout-model region it mostly lies in.
+    void markLayout(const QVector<LayoutRegion> &regions)
+    {
+        for (ReadLine &l : *lines) {
+            const double area = std::max(1.0, l.box.width() * l.box.height());
+            double bestFraction = 0, bestArea = 0;
+            const LayoutRegion *best = nullptr;
+            for (const LayoutRegion &r : regions) {
+                const QRectF i = l.box.intersected(r.rect);
+                if (i.isEmpty())
+                    continue;
+                const double fraction = i.width() * i.height() / area;
+                const double regionArea = r.rect.width() * r.rect.height();
+                if (fraction >= 0.5 && (!best || fraction > bestFraction + 0.05
+                                        || (fraction > bestFraction - 0.05 && regionArea < bestArea))) {
+                    best = &r;
+                    bestFraction = fraction;
+                    bestArea = regionArea;
+                }
+            }
+            if (best) {
+                l.layout = best->label;
+                l.layoutScore = best->score;
+            }
+        }
+    }
+
+    void debugLayout(int page)
+    {
+        if (!qEnvironmentVariableIsSet("GLANCE_READ_TAGS"))
+            return;
+        for (const ReadLine &l : *lines)
+            fprintf(stderr, "lay p%d %-16s %.2f grid=%d y=%.0f %s\n", page + 1, l.layout.toUtf8().constData(),
+                    l.layoutScore, int(l.inGrid), l.box.y(), l.text.left(40).toUtf8().constData());
+    }
+
     // Only grids that look like tables: not a page-sized frame (slide backgrounds,
     // page borders) and holding several lines of text.
     void markGrids(QSizeF pageSize)
@@ -1783,6 +1841,12 @@ QVariantList Document::readingParagraphs(const QVariantMap &options) const
                 collector.mergeSameRow();
                 collector.markPictures(sizes[p]);
                 collector.markGrids(sizes[p]);
+                {
+                    QMutexLocker layoutLock(&m_layoutMutex);
+                    if (m_layout.contains(p))
+                        collector.markLayout(m_layout.value(p));
+                }
+                collector.debugLayout(p);
             }
             fz_always(m_ctx) {
                 fz_drop_stext_page(m_ctx, text);

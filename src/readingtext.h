@@ -10,6 +10,14 @@
 // footnotes, captions, tables, references). Pure Qt: no MuPDF or QML types, so
 // native text and OCR lines can feed the same code.
 
+// A region found by the page-layout model: what it is (table, figure_title,
+// header, footer, paragraph_title, text, display_formula...) and where.
+struct LayoutRegion {
+    QString label;
+    double score = 0;
+    QRectF rect;                 // page points, relative to the page origin
+};
+
 struct ReadLine {
     QRectF box;          // page coordinates, points
     double size = 0;     // font size, points
@@ -25,6 +33,8 @@ struct ReadLine {
     double mathFraction = 0;      // share of its characters set in maths fonts
     double imageFraction = 0;     // share of its box lying over a picture
     bool inGrid = false;          // inside a table as MuPDF's table finder sees it
+    QString layout;               // label of the layout-model region it lies in, if analysed
+    double layoutScore = 0;
 };
 
 struct ReadOptions {

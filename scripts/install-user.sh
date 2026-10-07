@@ -20,6 +20,7 @@ if [ ! -x "$lib_dir/ocr-runtime/bin/python" ] \
 fi
 install -m 755 "$repo_dir/scripts/kokoro-worker.py" "$lib_dir/glance-kokoro-worker"
 install -m 755 "$repo_dir/scripts/setup-tts.sh" "$lib_dir/glance-setup-tts"
+install -m 755 "$repo_dir/scripts/layout-worker.py" "$lib_dir/glance-layout-worker"
 rm -rf "$lib_dir/qml"
 cp -R "$repo_dir/qml" "$lib_dir/qml"
 find "$lib_dir/qml" -type f -exec chmod 644 {} +

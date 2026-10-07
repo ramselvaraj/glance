@@ -56,6 +56,9 @@ Window {
     property var readOverrides: ({})         // paragraph key -> "read" | "skip", from the user
     property bool readFollow: true
     property double readScrollStamp: 0       // when the reader last scrolled the view itself
+    property bool readPreparing: false       // waiting for the page-layout model to look at the first pages
+    property int readStartPage: 0
+    property int readLayoutCount: 0          // pages the layout model had analysed when the list was last built
     property bool showSettings: false
     property bool confirmRemoveModel: false
     readonly property bool aiOn: Features.ai
@@ -808,21 +811,73 @@ Window {
             return
         }
         readMode = "doc"
-        if (readAll === null)
-            readLoadAll()
+        readActive = true
+        readFollow = true
+        readStartPage = selectAllDoc ? 0 : viewPosition().page
+        // The layout model reads the first pages before the voice starts; the
+        // rest is analysed in the background while it speaks.
+        if (PageLayout.available && !PageLayout.ensure(readStartPage, 3)) {
+            readPreparing = true
+            return
+        }
+        readBegin()
+    }
+
+    function readBegin() {
+        readPreparing = false
+        readLoadAll()
+        readLayoutCount = Doc.layoutPageCount()
         readRebuildList()
         if (readList.length === 0) {
             setStatus("no readable text in this document")
-            readActive = false
+            closeReader()
             return
         }
-        readActive = true
-        readFollow = true
         Reader.start(readList.map(p => p.text), selectAllDoc ? 0 : readStartIndex(), readList.map(p => p.kind))
+        if (PageLayout.available) {
+            PageLayout.analyzeFrom(readStartPage + 3)
+            layoutRefresh.restart()
+        }
+    }
+
+    // As more pages are analysed the reading list is judged again and swapped in
+    // without a break in the voice.
+    function readRefreshLayout() {
+        if (!readActive || readMode !== "doc" || readPreparing || readAll === null
+                || Reader.state === 0)
+            return
+        const count = Doc.layoutPageCount()
+        if (count === readLayoutCount) {
+            if (!PageLayout.busy)
+                layoutRefresh.stop()
+            return
+        }
+        // Judging the whole document again costs a moment, so on a long one wait
+        // for a good batch of new pages unless the analysis has finished.
+        if (PageLayout.busy && count - readLayoutCount < Math.max(3, Math.round(pageCount * 0.08)))
+            return
+        if (!Reader.canRefresh())
+            return                  // synthesizing right now; the next tick tries again
+        const cur = readList[Reader.paragraph]
+        if (!cur)
+            return
+        readLayoutCount = count
+        readLoadAll()
+        readRebuildList()
+        const idx = readIndexAt(cur.boxes[0].page, cur.boxes[0].y)
+        const texts = readList.map(p => p.text)
+        const kinds = readList.map(p => p.kind)
+        if (!Reader.refresh(texts, kinds, idx, Reader.sentence))
+            Reader.start(texts, idx, kinds)
+        lensKey = ""
+        readUpdateHighlight()
     }
 
     function closeReader() {
         Reader.stop()
+        readPreparing = false
+        layoutRefresh.stop()
+        PageLayout.stop()
         showLyrics = false
         showLens = false
         readActive = false
@@ -840,6 +895,8 @@ Window {
             showSettings = true
             return
         }
+        if (readPreparing)
+            return
         if (!readActive)
             startReading()
         else if (Reader.state === 0)
@@ -1138,6 +1195,21 @@ Window {
         property: "contentY"
         duration: 380
         easing.type: Easing.OutCubic
+    }
+
+    Connections {
+        target: PageLayout
+        function onRangeReady() {
+            if (root.readPreparing)
+                root.readBegin()
+        }
+    }
+
+    Timer {
+        id: layoutRefresh
+        interval: 2500
+        repeat: true
+        onTriggered: root.readRefreshLayout()
     }
 
     Connections {
@@ -3213,7 +3285,7 @@ Window {
                     wrapMode: Text.WordWrap
                     text: Reader.installing ? (root.readInstallLog !== "" ? root.readInstallLog : "Starting…")
                           : (root.readInstallLog !== "" ? root.readInstallLog
-                             : "It needs a one-time download of about 600 MB (the Kokoro voice model and a small Python runtime). Nothing is sent anywhere; everything stays local.")
+                             : "It needs a one-time download of about 850 MB (the Kokoro voice, a page-layout model and a small Python runtime). Nothing is sent anywhere; everything stays local.")
                     color: Theme.mutedForeground
                     font.pixelSize: 12
                     renderType: Text.QtRendering
@@ -3372,7 +3444,8 @@ Window {
                     id: infoText
                     anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    text: Reader.state === 1 ? "Loading voice…"
+                    text: root.readPreparing ? "Looking at the page layout…"
+                          : Reader.state === 1 ? "Loading voice…"
                           : "¶ " + (Reader.paragraph + 1) + " of " + root.readList.length
                             + " · p." + (Reader.paragraph >= 0 && root.readList[Reader.paragraph]
                                               ? root.readList[Reader.paragraph].page + 1 : "")
@@ -3656,9 +3729,44 @@ Window {
                     renderType: Text.QtRendering
                 }
 
+                Text {
+                    width: parent.width
+                    wrapMode: Text.WordWrap
+                    visible: Reader.available
+                    text: Reader.installing ? "Downloading the page layout model…"
+                          : (PageLayout.available
+                             ? "Page layout model: installed. It looks at each page to tell tables, figures, captions and headings apart."
+                             : "Page layout model: not downloaded. It makes skipping tables, figures and captions far more reliable (about 210 MB).")
+                    color: Theme.foreground
+                    font.pixelSize: 12
+                    renderType: Text.QtRendering
+                }
+
                 Flow {
                     width: parent.width
                     spacing: 8
+
+                    Rectangle {
+                        visible: Reader.available && !PageLayout.available && !Reader.installing
+                        width: layoutDlText.implicitWidth + 24
+                        height: 28
+                        radius: 14
+                        color: Theme.accent
+                        Text {
+                            id: layoutDlText
+                            anchors.centerIn: parent
+                            text: "Download page layout model"
+                            color: Theme.darkerBackground
+                            font.pixelSize: 12
+                            font.weight: Font.DemiBold
+                            renderType: Text.QtRendering
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Reader.install()
+                        }
+                    }
 
                     Rectangle {
                         visible: Reader.available
