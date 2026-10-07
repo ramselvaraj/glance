@@ -3934,6 +3934,27 @@ Window {
     // typing doesn't trigger navigation (or quit!).
     readonly property bool typing: searchField.activeFocus || cmdField.activeFocus
 
+    // A text field keeps keyboard focus until something else takes it, and a click
+    // on the page doesn't. Hand focus back to the view on any click outside the
+    // search and command fields, so shortcuts (m, v, s ...) work again.
+    Item {
+        anchors.fill: parent
+        z: 1000
+        PointHandler {
+            acceptedButtons: Qt.AllButtons
+            grabPermissions: PointerHandler.ApprovesTakeOverByAnything
+            onActiveChanged: {
+                if (!active || !root.typing)
+                    return
+                const p = point.scenePosition
+                const inField = (f) => f.visible
+                    && f.contains(f.mapFromItem(null, p.x, p.y))
+                if (!inField(searchField) && !inField(cmdField))
+                    view.forceActiveFocus()
+            }
+        }
+    }
+
     Shortcut { sequence: "Ctrl+q"; onActivated: Qt.quit() }
     Shortcut { sequence: "F1"; onActivated: root.showKeys = !root.showKeys }
     Shortcut { sequence: "Ctrl+c"; enabled: !root.typing; onActivated: root.copyPage() }
