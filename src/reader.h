@@ -59,16 +59,24 @@ public:
     // Downloads the Kokoro runtime and model (about 120 MB) into the user's data dir.
     Q_INVOKABLE void install();
     // Sentences of a paragraph, exactly as they are spoken one at a time.
-    Q_INVOKABLE static QStringList splitSentences(const QString &paragraph);
+    // `kind` is the paragraph's kind: a heading is one unit, never split.
+    Q_INVOKABLE static QStringList splitSentences(const QString &paragraph, const QString &kind = QString());
     // What of `sentence` is actually spoken (citations, links and the like removed).
-    Q_INVOKABLE static QString speakable(const QString &sentence) { return cleanForSpeech(sentence); }
+    Q_INVOKABLE static QString speakable(const QString &sentence, const QString &kind = QString())
+    {
+        return kind == QLatin1String("heading") ? cleanForSpeech(speechForHeading(sentence))
+                                                : cleanForSpeech(sentence);
+    }
     // The same sentences as [{start, end}] character ranges in `paragraph`.
-    Q_INVOKABLE static QVariantList sentenceRanges(const QString &paragraph);
+    Q_INVOKABLE static QVariantList sentenceRanges(const QString &paragraph, const QString &kind = QString());
     // What is being spoken, one entry per sentence: [{paragraph, sentence, text}].
     // `text` is the cleaned wording ("" for fragments with nothing to say).
     Q_INVOKABLE QVariantList units() const;
     // Starts reading `paragraphs` at `index`.
-    Q_INVOKABLE void start(const QStringList &paragraphs, int index = 0);
+    // `kinds` (parallel to `paragraphs`, optional) lets headings and list items be
+    // spoken and paced differently from running text.
+    Q_INVOKABLE void start(const QStringList &paragraphs, int index = 0,
+                           const QStringList &kinds = QStringList());
     Q_INVOKABLE void pause();
     Q_INVOKABLE void resume();
     Q_INVOKABLE void toggle();
@@ -101,10 +109,13 @@ private:
         QString text;                // cleaned for speech; empty = nothing to say
         qint64 endByte = 0;          // cumulative end offset once queued for playback
         qint64 audioBytes = 0;       // length of the speech itself, without the pause after it
+        QString kind;                // body, heading...
+        bool listItem = false;       // a bullet or numbered item: shorter gap after it
     };
 
     static QString dataDir();
     static QString cleanForSpeech(const QString &sentence);
+    static QString speechForHeading(const QString &heading);
     void setState(State state);
     void restartAt(int unit);
     void ensureWorker();

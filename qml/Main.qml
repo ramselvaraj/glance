@@ -757,7 +757,7 @@ Window {
         }
         const idx = next ? readIndexAt(next.page, next.y) : readList.length - 1
         readFollow = true
-        Reader.start(readList.map(x => x.text), idx)
+        Reader.start(readList.map(x => x.text), idx, readList.map(x => x.kind))
     }
 
     function readSkipCurrent() {
@@ -804,7 +804,7 @@ Window {
             readList = [{ text: text, kind: "body", page: 0, boxes: [] }]
             readSkipBoxes = ({})
             readActive = true
-            Reader.start([text], 0)
+            Reader.start([text], 0, ["body"])
             return
         }
         readMode = "doc"
@@ -818,7 +818,7 @@ Window {
         }
         readActive = true
         readFollow = true
-        Reader.start(readList.map(p => p.text), selectAllDoc ? 0 : readStartIndex())
+        Reader.start(readList.map(p => p.text), selectAllDoc ? 0 : readStartIndex(), readList.map(p => p.kind))
     }
 
     function closeReader() {
@@ -863,7 +863,7 @@ Window {
             closeReader()
             return
         }
-        Reader.start(readList.map(p => p.text), idx)
+        Reader.start(readList.map(p => p.text), idx, readList.map(p => p.kind))
     }
 
     // A click on a paragraph while reading continues from there.
@@ -903,7 +903,7 @@ Window {
         const para = {}
         for (const b of p.boxes)
             readPush(para, b.page, b)
-        const ranges = Reader.sentenceRanges(p.text)
+        const ranges = Reader.sentenceRanges(p.text, p.kind)
         const r = ranges[Reader.sentence]
         const sent = {}
         let first = null
@@ -1067,7 +1067,7 @@ Window {
         const p = readList[Reader.paragraph]
         if (!p || p.id === undefined)
             return
-        const r = Reader.sentenceRanges(p.text)[Reader.sentence]
+        const r = Reader.sentenceRanges(p.text, p.kind)[Reader.sentence]
         if (!r)
             return
         const offset = r.start + lensCharAt(p.text.slice(r.start, r.end), Reader.unitProgress)

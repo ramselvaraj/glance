@@ -225,7 +225,13 @@ int main(int argc, char *argv[])
     }
 
     if (parser.isSet(cleanSelfOpt)) {
-        printf("%s\n", Reader::speakable(parser.value(cleanSelfOpt)).toUtf8().constData());
+        QString text = parser.value(cleanSelfOpt);
+        QString kind;
+        if (text.startsWith(QLatin1String("heading:"))) {
+            kind = QStringLiteral("heading");
+            text = text.mid(8);
+        }
+        printf("%s\n", Reader::speakable(text, kind).toUtf8().constData());
         return 0;
     }
 
@@ -247,6 +253,16 @@ int main(int argc, char *argv[])
             fprintf(stderr, "tts-selftest: paragraph of %d chars -> %d sentences\n", int(t.size()), int(sents.size()));
             for (const QString &x : sents)
                 fprintf(stderr, "    [%s]\n", x.left(90).toUtf8().constData());
+        }
+        QStringList kinds(texts.size(), QStringLiteral("body"));
+        if (qEnvironmentVariableIsSet("GLANCE_TTS_DEMO")) {
+            texts = {QStringLiteral("The first paragraph explains the idea in two short sentences. It ends here."),
+                     QStringLiteral("3.2 DESIGN ELABORATION"),
+                     QStringLiteral("The next section starts with this sentence. Then it adds one more."),
+                     QStringLiteral("• A short list item"), QStringLiteral("• Another list item"),
+                     QStringLiteral("The last paragraph closes the demonstration.")};
+            kinds = {QStringLiteral("body"), QStringLiteral("heading"), QStringLiteral("body"),
+                     QStringLiteral("body"), QStringLiteral("body"), QStringLiteral("body")};
         }
         auto *reader = new Reader(&app);
         auto *clock = new QElapsedTimer;
@@ -273,7 +289,7 @@ int main(int argc, char *argv[])
             QTimer::singleShot(16000, reader, [reader] { fprintf(stderr, "-- previousParagraph\n"); reader->previousParagraph(); });
             QTimer::singleShot(20000, reader, [reader] { fprintf(stderr, "-- stop\n"); reader->stop(); QCoreApplication::quit(); });
         }
-        reader->start(texts, 0);
+        reader->start(texts, 0, kinds);
         return app.exec();
     }
 
@@ -291,7 +307,7 @@ int main(int argc, char *argv[])
             printf("p%d %-9s%s %s\n", m.value("page").toInt() + 1,
                    m.value("kind").toString().toUtf8().constData(),
                    m.value("skipped").toBool() ? " [skip]" : "       ",
-                   m.value("text").toString().left(110).toUtf8().constData());
+                   m.value("text").toString().left(qEnvironmentVariableIsSet("GLANCE_READ_FULL") ? 100000 : 110).toUtf8().constData());
         }
         return 0;
     }

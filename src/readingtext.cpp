@@ -334,6 +334,71 @@ void ReadModel::learn(const QVector<double> &f, bool junk)
         m_w[i] = std::clamp(m_w[i] + 0.1 * error * f[i], m_prior[i] - 1.0, m_prior[i] + 1.0);
 }
 
+
+// A sentence that runs across a page break, a column break or a figure ends up
+// as two paragraphs with page furniture, a caption or a table between them.
+// Join the halves and leave what came between after the joined paragraph.
+bool endsWithoutStop(const QString &t)
+{
+    const QString s = t.trimmed();
+    if (s.isEmpty())
+        return false;
+    const QChar last = s.back();
+    if (last == QLatin1Char('-') || last == QLatin1Char(',') || last == QLatin1Char(';'))
+        return true;
+    if (last.isLetterOrNumber()) {
+        // "...of the" / "...and" cannot be the end of a sentence either way; a bare
+        // noun can (headings, list items), so only a clear continuation joins.
+        return true;
+    }
+    return false;
+}
+
+bool continuesSentence(const QString &next)
+{
+    const QString s = next.trimmed();
+    return !s.isEmpty() && (s.front().isLower() || s.front() == QLatin1Char(')') || s.front() == QLatin1Char(','));
+}
+
+void joinBrokenParagraphs(QVector<ReadParagraph> &paras)
+{
+    for (int i = 0; i < paras.size(); ++i) {
+        ReadParagraph &a = paras[i];
+        if (a.kind != QLatin1String("body") || a.skipped || !endsWithoutStop(a.text) || a.text.size() < 30)
+            continue;
+        // The paragraph that carries the sentence on: the next ordinary body text,
+        // with only furniture and floats allowed in between.
+        int j = i + 1;
+        for (; j < paras.size() && j <= i + 14; ++j) {
+            const QString &k = paras[j].kind;
+            if (k == QLatin1String("body"))
+                break;
+            if (k == QLatin1String("heading") || k == QLatin1String("reference"))
+                j = paras.size();   // a new section: nothing to join
+        }
+        if (j >= paras.size() || j > i + 14)
+            continue;
+        ReadParagraph &b = paras[j];
+        if (b.skipped || !continuesSentence(b.text))
+            continue;
+        const bool hyphen = a.text.endsWith(QLatin1Char('-')) && a.text.size() > 1
+                            && a.text[a.text.size() - 2].isLetter();
+        if (hyphen)
+            a.text.chop(1);
+        else
+            a.text += QLatin1Char(' ');
+        const int shift = int(a.text.size());
+        for (ReadBox box : std::as_const(b.boxes)) {
+            box.start += shift;
+            box.end += shift;
+            a.boxes.push_back(box);
+        }
+        a.text += b.text;
+        paras.removeAt(j);
+        --i;   // the joined paragraph may continue yet again
+    }
+}
+
 QVector<ReadParagraph> buildReadingParagraphs(const QVector<QVector<ReadLine>> &pages,
                                               const QVector<QSizeF> &pageSizes,
                                               const ReadOptions &options,
@@ -657,5 +722,6 @@ QVector<ReadParagraph> buildReadingParagraphs(const QVector<QVector<ReadLine>> &
         }
     }
     flush();
+    joinBrokenParagraphs(out);
     return out;
 }

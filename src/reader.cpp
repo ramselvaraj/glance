@@ -13,12 +13,18 @@
 #include <QTextBoundaryFinder>
 #include <signal.h>
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
 constexpr int kPrefetchUnits = 3;          // sentences synthesized ahead of the one playing
-constexpr int kSentencePauseMs = 140;
-constexpr int kParagraphPauseMs = 420;
+// Gaps are what let a listener take in what was just said. They are scaled by
+// the speaking speed so that fast reading keeps its proportions.
+constexpr int kSentencePauseMs = 280;
+constexpr int kParagraphPauseMs = 1000;
+constexpr int kListItemPauseMs = 650;
+constexpr int kBeforeHeadingMs = 1600;
+constexpr int kAfterHeadingMs = 1100;
 constexpr int kLeadMs = 300;               // audio kept queued in the player
 
 QString workerScript()
@@ -165,8 +171,12 @@ void Reader::install()
     emit installingChanged();
 }
 
-QStringList Reader::splitSentences(const QString &paragraph)
+QStringList Reader::splitSentences(const QString &paragraph, const QString &kind)
 {
+    if (kind == QLatin1String("heading")) {
+        const QString whole = paragraph.trimmed();
+        return whole.isEmpty() ? QStringList() : QStringList{whole};
+    }
     QStringList out;
     QTextBoundaryFinder finder(QTextBoundaryFinder::Sentence, paragraph);
     int start = 0;
@@ -204,11 +214,11 @@ QStringList Reader::splitSentences(const QString &paragraph)
     return bounded;
 }
 
-QVariantList Reader::sentenceRanges(const QString &paragraph)
+QVariantList Reader::sentenceRanges(const QString &paragraph, const QString &kind)
 {
     QVariantList out;
     int pos = 0;
-    for (const QString &s : splitSentences(paragraph)) {
+    for (const QString &s : splitSentences(paragraph, kind)) {
         int at = paragraph.indexOf(s, pos);
         if (at < 0)
             at = pos;   // a merged sentence whose gap differs: fall back to the running offset
@@ -217,6 +227,38 @@ QVariantList Reader::sentenceRanges(const QString &paragraph)
         pos = at + s.size();
     }
     return out;
+}
+
+// A heading read aloud as written is abrupt: "3.2 DESIGN ELABORATION" becomes
+// the title "Design Elaboration." and ends with a falling tone.
+QString Reader::speechForHeading(const QString &heading)
+{
+    static const QRegularExpression numbering(
+        QStringLiteral(R"(^(?:(?:section|chapter|part|appendix)\s+)?(?:\d+(?:\.\d+)*\.?|[IVXLC]+\.|[A-Z]\.)\s+)"),
+        QRegularExpression::CaseInsensitiveOption);
+    QString s = heading.simplified();
+    s.remove(numbering);
+    bool hasLower = false;
+    for (const QChar ch : std::as_const(s))
+        if (ch.isLower()) {
+            hasLower = true;
+            break;
+        }
+    if (!hasLower && !s.isEmpty()) {
+        // ALL CAPS would be spelled out letter by letter.
+        static const QStringList small = {QStringLiteral("a"), QStringLiteral("an"), QStringLiteral("and"),
+                                          QStringLiteral("the"), QStringLiteral("of"), QStringLiteral("for"),
+                                          QStringLiteral("in"), QStringLiteral("on"), QStringLiteral("to"),
+                                          QStringLiteral("with"), QStringLiteral("vs")};
+        QStringList words = s.toLower().split(QLatin1Char(' '));
+        for (int i = 0; i < words.size(); ++i)
+            if (i == 0 || !small.contains(words[i]))
+                words[i][0] = words[i][0].toUpper();
+        s = words.join(QLatin1Char(' '));
+    }
+    if (!s.isEmpty() && !QStringLiteral(".!?:").contains(s.back()))
+        s += QLatin1Char('.');
+    return s;
 }
 
 QString Reader::cleanForSpeech(const QString &sentence)
@@ -303,7 +345,7 @@ int Reader::firstUnitOf(int paragraph) const
     return m_units.size();
 }
 
-void Reader::start(const QStringList &paragraphs, int index)
+void Reader::start(const QStringList &paragraphs, int index, const QStringList &kinds)
 {
     if (!m_enabled)
         return;
@@ -313,10 +355,21 @@ void Reader::start(const QStringList &paragraphs, int index)
     }
     m_units.clear();
     m_paragraphCount = paragraphs.size();
+    static const QRegularExpression listMarker(QStringLiteral(R"(^\s*(?:[•▪◦●*\-–—]|\(?\d{1,2}[.)]|\(?[a-z][.)])\s)"));
     for (int p = 0; p < paragraphs.size(); ++p) {
-        const QStringList sentences = splitSentences(paragraphs[p]);
-        for (int s = 0; s < sentences.size(); ++s)
-            m_units.append({p, s, cleanForSpeech(sentences[s]), 0});
+        const QString kind = p < kinds.size() ? kinds[p] : QString();
+        const bool item = kind != QLatin1String("heading") && listMarker.match(paragraphs[p]).hasMatch();
+        const QStringList sentences = splitSentences(paragraphs[p], kind);
+        for (int s = 0; s < sentences.size(); ++s) {
+            Unit u;
+            u.paragraph = p;
+            u.sentence = s;
+            u.text = kind == QLatin1String("heading") ? cleanForSpeech(speechForHeading(sentences[s]))
+                                                      : cleanForSpeech(sentences[s]);
+            u.kind = kind;
+            u.listItem = item;
+            m_units.append(u);
+        }
     }
     emit unitsChanged();
     if (m_units.isEmpty()) {
@@ -393,7 +446,8 @@ void Reader::requestMore()
     const QJsonObject req{{QStringLiteral("id"), m_nextRequest},
                           {QStringLiteral("text"), m_units[m_nextRequest].text},
                           {QStringLiteral("voice"), m_voice},
-                          {QStringLiteral("speed"), m_speed}};
+                          {QStringLiteral("speed"),
+                           m_units[m_nextRequest].kind == QLatin1String("heading") ? m_speed * 0.9 : m_speed}};
     ++m_nextRequest;
     m_worker.write(QJsonDocument(req).toJson(QJsonDocument::Compact) + '\n');
 }
@@ -545,7 +599,21 @@ void Reader::handleAudio(int unitIndex, int rate, const QByteArray &pcm)
     QByteArray audio = pcm;
     const bool lastOfParagraph = unitIndex + 1 >= m_units.size()
         || m_units[unitIndex + 1].paragraph != m_units[unitIndex].paragraph;
-    const int pauseMs = lastOfParagraph ? kParagraphPauseMs : kSentencePauseMs;
+    const Unit &unit = m_units[unitIndex];
+    int pauseMs = kSentencePauseMs;
+    if (lastOfParagraph) {
+        const bool nextIsHeading = unitIndex + 1 < m_units.size()
+            && m_units[unitIndex + 1].kind == QLatin1String("heading");
+        if (unit.kind == QLatin1String("heading"))
+            pauseMs = kAfterHeadingMs;
+        else if (nextIsHeading)
+            pauseMs = kBeforeHeadingMs;
+        else if (unit.listItem)
+            pauseMs = kListItemPauseMs;
+        else
+            pauseMs = kParagraphPauseMs;
+    }
+    pauseMs = int(pauseMs / std::sqrt(std::max(0.75, m_speed)));
     audio.append(QByteArray(rate * pauseMs / 1000 * 2, '\0'));
     m_pending += audio;
     m_queuedBytes += audio.size();
