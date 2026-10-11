@@ -2119,6 +2119,8 @@ Window {
                 color: fileName !== "" ? Theme.foreground : Theme.mutedForeground
                 font.pixelSize: 13
                 elide: Text.ElideMiddle
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
                 Layout.maximumWidth: parent.width * 0.4
                 renderType: Text.QtRendering
             }
@@ -2140,6 +2142,7 @@ Window {
                 color: Theme.mutedForeground
                 font.pixelSize: 12
                 Layout.preferredWidth: 46
+                visible: root.width >= 420
                 renderType: Text.QtRendering
             }
             Item { Layout.fillWidth: true }
@@ -2257,7 +2260,7 @@ Window {
             }
             Rectangle {
                 id: keysButton
-                Layout.preferredWidth: keysLabel.implicitWidth + 24
+                Layout.preferredWidth: keysLabel.implicitWidth + (root.width < 420 ? 14 : 24)
                 Layout.preferredHeight: 26
                 radius: Theme.cornerRadius
                 color: keysMouse.containsMouse || root.showKeys ? Theme.selection : "transparent"
@@ -2266,7 +2269,7 @@ Window {
                 Text {
                     id: keysLabel
                     anchors.centerIn: parent
-                    text: "Keybindings"
+                    text: root.width < 420 ? "?" : "Keybindings"
                     color: keysMouse.containsMouse || root.showKeys
                            ? Theme.accent : Theme.foreground
                     font.pixelSize: 12
